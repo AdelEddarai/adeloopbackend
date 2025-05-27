@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic
+pandas
+numpy
+matplotlib
+seaborn
+aiohttp
+python-dotenv
+pyjwt
