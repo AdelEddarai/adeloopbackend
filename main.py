@@ -293,7 +293,9 @@ class DataAnalyzer:
 class QueryRequest(BaseModel):
     query: str
     language: str
-    datasetId: str
+    datasetId: str = ""  # Keep for backward compatibility, make optional
+    datasetIds: Optional[List[str]] = None  # New field for multiple datasets
+    datasets: Optional[List[Dict[str, Any]]] = None  # New field for dataset data
 
 async def get_auth_token() -> str:
     # Create a JWT token that Clerk will accept
@@ -431,10 +433,54 @@ async def execute_query(request: Request, query_request: QueryRequest):
             raise HTTPException(status_code=401, detail="Authorization header is required")
 
         if query_request.language == "python":
-            df = await get_dataset_from_nextjs(query_request.datasetId, auth_token)
-
-            if df is None:
-                raise HTTPException(status_code=404, detail="Dataset not found")
+            # Handle multiple datasets - use data passed directly from frontend
+            datasets = {}
+            dataset_paths = {}
+            
+            # Check if datasets are passed directly in the request
+            if hasattr(query_request, 'datasets') and query_request.datasets:
+                # Use datasets passed directly from frontend
+                for i, dataset_info in enumerate(query_request.datasets):
+                    if dataset_info and 'data' in dataset_info:
+                        df_data = pd.DataFrame(dataset_info['data'])
+                        dataset_id = dataset_info.get('id', f'dataset_{i+1}')
+                        dataset_name = dataset_info.get('name', f'Dataset {i+1}')
+                        
+                        # Store datasets with numbered keys
+                        datasets[f'df{i+1}'] = df_data
+                        
+                        # Create virtual file paths that users can use with pd.read_csv()
+                        dataset_paths[f'dataset{i+1}.csv'] = df_data
+                        
+                        # Also create paths using the dataset ID and name as filename
+                        dataset_paths[f'{dataset_id}.csv'] = df_data
+                        dataset_paths[f'{dataset_name.lower().replace(" ", "_")}.csv'] = df_data
+                        
+                        if i == 0:
+                            datasets['df'] = df_data
+                            dataset_paths['dataset.csv'] = df_data
+            else:
+                # Fallback: try to load from Next.js API (old method)
+                dataset_ids = query_request.datasetIds if query_request.datasetIds else [query_request.datasetId] if query_request.datasetId else []
+                
+                for i, dataset_id in enumerate(dataset_ids):
+                    if dataset_id and dataset_id != 'no-dataset':  # Skip empty or placeholder dataset IDs
+                        try:
+                            df_data = await get_dataset_from_nextjs(dataset_id, auth_token)
+                            if df_data is not None:
+                                # Store datasets with numbered keys
+                                datasets[f'df{i+1}'] = df_data
+                                
+                                # Create virtual file paths that users can use with pd.read_csv()
+                                dataset_paths[f'dataset{i+1}.csv'] = df_data
+                                dataset_paths[f'{dataset_id}.csv'] = df_data
+                                
+                                if i == 0:
+                                    datasets['df'] = df_data
+                                    dataset_paths['dataset.csv'] = df_data
+                        except Exception as e:
+                            print(f"Warning: Could not load dataset {dataset_id}: {str(e)}")
+                            # Continue without this dataset
 
             # Initialize plot style
             PlotManager.setup_default_style()
@@ -447,7 +493,7 @@ async def execute_query(request: Request, query_request: QueryRequest):
             local_ns = {
                 # Core libraries
                 'pd': pd,
-                'df': df,
+                **datasets,  # Add all datasets to namespace
                 'np': np,
                 'plt': plt,
                 'sns': sns,
@@ -462,7 +508,13 @@ async def execute_query(request: Request, query_request: QueryRequest):
                 'describe': lambda x: pd.DataFrame(x.describe()),
                 'get_plot': lambda: PlotManager.get_plot_as_base64(),  # Make it a function call
                 'analyzer': DataAnalyzer(),
-                'available_columns': list(df.columns),
+                'available_columns': list(datasets.get('df', pd.DataFrame()).columns) if datasets else [],
+                
+                # Dataset paths for reference
+                'available_datasets': list(dataset_paths.keys()) if dataset_paths else [],
+                
+                # Debug function to show available datasets
+                'show_datasets': lambda: print(f"📊 Available datasets: {list(dataset_paths.keys()) if dataset_paths else 'None selected'}"),
 
                 # Package management helpers
                 'pip_list': lambda: __import__('subprocess').check_output([__import__('sys').executable, '-m', 'pip', 'list']).decode('utf-8'),
@@ -477,6 +529,23 @@ async def execute_query(request: Request, query_request: QueryRequest):
                     'missing': df.isnull().sum(),
                     'missing_pct': df.isnull().sum() / len(df) * 100,
                 }),
+                
+                # Multiple dataset helpers
+                'list_datasets': lambda: [name for name in locals() if name.startswith('df') and isinstance(locals()[name], pd.DataFrame)],
+                'compare_datasets': lambda df1, df2: {
+                    'df1_shape': df1.shape,
+                    'df2_shape': df2.shape,
+                    'common_columns': list(set(df1.columns) & set(df2.columns)),
+                    'df1_only_columns': list(set(df1.columns) - set(df2.columns)),
+                    'df2_only_columns': list(set(df2.columns) - set(df1.columns))
+                },
+                'merge_datasets': lambda df1, df2, on=None, how='inner': pd.merge(df1, df2, on=on, how=how) if on else pd.merge(df1, df2, how=how),
+                'concat_datasets': lambda *dfs, **kwargs: pd.concat(dfs, **kwargs),
+                
+                # Dataset information
+                'dataset_count': len(datasets),
+                'dataset_names': list(datasets.keys()),
+                'ui_datasets_loaded': len(datasets) > 0,
                 'plot_histogram': lambda col, bins=10: (plt.figure(figsize=(10, 6)), plt.hist(df[col].dropna(), bins=bins), plt.title(f'Histogram of {col}'), plt.xlabel(col), plt.ylabel('Frequency'), plt.tight_layout(), PlotManager.get_plot_as_base64()),
                 'plot_boxplot': lambda col: (plt.figure(figsize=(10, 6)), plt.boxplot(df[col].dropna()), plt.title(f'Boxplot of {col}'), plt.ylabel(col), plt.tight_layout(), PlotManager.get_plot_as_base64()),
                 'plot_scatter': lambda x, y: (plt.figure(figsize=(10, 6)), plt.scatter(df[x], df[y]), plt.title(f'Scatter plot of {x} vs {y}'), plt.xlabel(x), plt.ylabel(y), plt.tight_layout(), PlotManager.get_plot_as_base64()),
@@ -504,33 +573,64 @@ async def execute_query(request: Request, query_request: QueryRequest):
                         print(f"Failed to install {module_name}: {str(e)}")
                         raise
 
-            # Add file reading capability (safely)
-            def safe_read_file(file_path, mode='r'):
-                """Safely read a file with various formats supported"""
-                import os
-                if not os.path.exists(file_path):
-                    raise FileNotFoundError(f"File not found: {file_path}")
+            # Create custom pandas read functions that work with selected datasets
+            def custom_read_csv(filepath_or_buffer, **kwargs):
+                """Custom pd.read_csv that can use selected datasets as virtual files"""
+                if isinstance(filepath_or_buffer, str):
+                    # Check if it's one of our virtual dataset paths (exact match)
+                    if filepath_or_buffer in dataset_paths:
+                        print(f"✓ Found exact match for '{filepath_or_buffer}'")
+                        return dataset_paths[filepath_or_buffer].copy()
+                    
+                    # Check if the filename (without extension) matches any dataset name
+                    filename_base = filepath_or_buffer.replace('.csv', '').replace('.xlsx', '').replace('.xls', '').lower()
+                    
+                    # Look for datasets by name (case-insensitive partial matching)
+                    for path, data in dataset_paths.items():
+                        path_base = path.replace('.csv', '').lower()
+                        if filename_base == path_base or filename_base in path_base or path_base in filename_base:
+                            print(f"✓ Found partial match: '{filepath_or_buffer}' → '{path}'")
+                            return data.copy()
+                
+                # Otherwise, try to read the actual file
+                try:
+                    return pd.read_csv(filepath_or_buffer, **kwargs)
+                except Exception as e:
+                    # If file not found, provide helpful error message
+                    if dataset_paths:
+                        available = sorted(list(dataset_paths.keys()))
+                        error_msg = f"""
+❌ File '{filepath_or_buffer}' not found.
 
-                # Check file extension
-                ext = os.path.splitext(file_path)[1].lower()
-                if ext == '.csv':
-                    return pd.read_csv(file_path)
-                elif ext == '.xlsx' or ext == '.xls':
-                    return pd.read_excel(file_path)
-                elif ext == '.json':
-                    return pd.read_json(file_path)
-                elif ext == '.parquet':
-                    return pd.read_parquet(file_path)
-                elif ext == '.pickle' or ext == '.pkl':
-                    return pd.read_pickle(file_path)
-                else:
-                    # Default to text file
-                    with open(file_path, mode) as f:
-                        return f.read()
+📊 Available datasets from your selection:
+{chr(10).join(f"   • {path}" for path in available)}
+
+💡 Usage examples:
+   df1 = pd.read_csv('{available[0] if available else "dataset1.csv"}')
+   df2 = pd.read_csv('{available[1] if len(available) > 1 else "dataset2.csv"}')
+
+🔍 Make sure the filename matches exactly (case-insensitive).
+"""
+                        raise FileNotFoundError(error_msg.strip())
+                    else:
+                        raise FileNotFoundError(f"""
+❌ File '{filepath_or_buffer}' not found.
+
+📊 No datasets selected from UI.
+
+💡 To fix this:
+   1. Select datasets using the database icon in the cell
+   2. Or use actual file paths: pd.read_csv('/path/to/your/file.csv')
+""".strip())
 
             # Add these to the namespace
             local_ns['import_module'] = custom_import
-            local_ns['read_file'] = safe_read_file
+            
+            # Override pandas read functions with our custom ones
+            local_ns['pd'].read_csv = custom_read_csv
+            
+            # Also add them directly to the namespace
+            local_ns['read_csv'] = custom_read_csv
 
             # Execute the code with Jupyter-like behavior
             with redirect_stdout(output):
