@@ -8,3 +8,18 @@ seaborn
 aiohttp
 python-dotenv
 pyjwt
+
+# Computer Vision Libraries
+mediapipe
+cvzone
+opencv-python
+opencv-contrib-python
+
+# Streamlit for interactive apps
+streamlit
+streamlit-webrtc
+
+# Additional image/video processing
+pillow
+imageio
+scikit-image

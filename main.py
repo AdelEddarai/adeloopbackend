@@ -18,6 +18,12 @@ import time
 import base64  # For encoding plots
 from io import BytesIO
 import traceback
+import random  # For random Streamlit app selection
+import tempfile
+import subprocess
+import threading
+import socket
+from pathlib import Path
 import math  # For handling special float values
 
 # Load environment variables
@@ -59,6 +65,143 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# Global variables for Streamlit app management
+streamlit_processes = {}
+streamlit_ports = {}
+
+def find_free_port():
+    """Find a free port for Streamlit app"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
+
+def get_host_url():
+    """Get the appropriate host URL based on environment"""
+    # Check if we're in a cloud environment
+    cloud_host = os.getenv('STREAMLIT_HOST')  # Can be set in cloud deployment
+    if cloud_host:
+        return cloud_host
+
+    # Check for common cloud environment variables
+    if os.getenv('VERCEL_URL'):
+        return f"https://{os.getenv('VERCEL_URL')}"
+    elif os.getenv('HEROKU_APP_NAME'):
+        return f"https://{os.getenv('HEROKU_APP_NAME')}.herokuapp.com"
+    elif os.getenv('RAILWAY_STATIC_URL'):
+        return os.getenv('RAILWAY_STATIC_URL')
+    elif os.getenv('RENDER_EXTERNAL_URL'):
+        return os.getenv('RENDER_EXTERNAL_URL')
+
+    # Default to localhost for local development
+    return "http://localhost"
+
+def create_streamlit_app(code: str, app_id: str) -> dict:
+    """Create and run a temporary Streamlit app from user code"""
+    try:
+        # Create a temporary directory for the app
+        temp_dir = tempfile.mkdtemp(prefix=f"streamlit_app_{app_id}_")
+        app_file = Path(temp_dir) / "app.py"
+
+        # Write the user's code to the app file
+        with open(app_file, 'w', encoding='utf-8') as f:
+            f.write(code)
+
+        # Find a free port
+        port = find_free_port()
+
+        # Start Streamlit app in a subprocess
+        cmd = [
+            "streamlit", "run", str(app_file),
+            "--server.port", str(port),
+            "--server.headless", "true",
+            "--server.enableCORS", "false",
+            "--server.enableXsrfProtection", "false",
+            "--browser.gatherUsageStats", "false"
+        ]
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=temp_dir
+        )
+
+        # Store process and port info
+        streamlit_processes[app_id] = {
+            'process': process,
+            'temp_dir': temp_dir,
+            'app_file': str(app_file),
+            'port': port
+        }
+        streamlit_ports[port] = app_id
+
+        # Give Streamlit a moment to start
+        import time
+        time.sleep(3)
+
+        # Check if process is still running
+        if process.poll() is None:
+            host_url = get_host_url()
+            app_url = f"{host_url}:{port}" if host_url.startswith('http://localhost') else f"{host_url}/streamlit-{port}"
+            embed_url = f"{app_url}?embed=true&embed_options=hide_loading_screen"
+
+            return {
+                'type': 'streamlit_app',
+                'embed_url': embed_url,
+                'open_url': app_url,
+                'title': f'Live Streamlit App',
+                'app_id': app_id,
+                'port': port,
+                'status': 'running',
+                'host_type': 'cloud' if not host_url.startswith('http://localhost') else 'local'
+            }
+        else:
+            # Process failed to start
+            stdout, stderr = process.communicate()
+            error_msg = stderr.decode('utf-8') if stderr else "Unknown error"
+            return {
+                'type': 'error',
+                'message': f'Failed to start Streamlit app: {error_msg}',
+                'status': 'failed'
+            }
+
+    except Exception as e:
+        return {
+            'type': 'error',
+            'message': f'Error creating Streamlit app: {str(e)}',
+            'status': 'failed'
+        }
+
+def cleanup_streamlit_app(app_id: str):
+    """Clean up a Streamlit app process and temporary files"""
+    if app_id in streamlit_processes:
+        app_info = streamlit_processes[app_id]
+
+        # Terminate the process
+        try:
+            app_info['process'].terminate()
+            app_info['process'].wait(timeout=5)
+        except:
+            try:
+                app_info['process'].kill()
+            except:
+                pass
+
+        # Clean up temporary files
+        try:
+            import shutil
+            shutil.rmtree(app_info['temp_dir'])
+        except:
+            pass
+
+        # Remove from tracking
+        port = app_info['port']
+        if port in streamlit_ports:
+            del streamlit_ports[port]
+        del streamlit_processes[app_id]
 
 class PlotManager:
     @staticmethod
@@ -445,19 +588,25 @@ async def execute_query(request: Request, query_request: QueryRequest):
                         df_data = pd.DataFrame(dataset_info['data'])
                         dataset_id = dataset_info.get('id', f'dataset_{i+1}')
                         dataset_name = dataset_info.get('name', f'Dataset {i+1}')
-                        
-                        # Store datasets with numbered keys
-                        datasets[f'df{i+1}'] = df_data
-                        
-                        # Create virtual file paths that users can use with pd.read_csv()
-                        dataset_paths[f'dataset{i+1}.csv'] = df_data
-                        
-                        # Also create paths using the dataset ID and name as filename
+
+                        # Create safe variable name from dataset name
+                        safe_name = dataset_name.lower().replace(' ', '_').replace('-', '_')
+                        safe_name = ''.join(c for c in safe_name if c.isalnum() or c == '_')
+                        if not safe_name or safe_name[0].isdigit():
+                            safe_name = f'dataset_{safe_name}' if safe_name else f'dataset_{i+1}'
+
+                        # Store datasets with actual names and numbered fallbacks
+                        datasets[safe_name] = df_data
+                        datasets[f'df{i+1}'] = df_data  # Keep numbered for compatibility
+
+                        # Create virtual file paths using actual names
+                        dataset_paths[f'{safe_name}.csv'] = df_data
+                        dataset_paths[f'dataset{i+1}.csv'] = df_data  # Keep numbered for compatibility
                         dataset_paths[f'{dataset_id}.csv'] = df_data
-                        dataset_paths[f'{dataset_name.lower().replace(" ", "_")}.csv'] = df_data
-                        
+
                         if i == 0:
                             datasets['df'] = df_data
+                            datasets[safe_name + '_main'] = df_data  # Alternative main reference
                             dataset_paths['dataset.csv'] = df_data
             else:
                 # Fallback: try to load from Next.js API (old method)
@@ -489,6 +638,12 @@ async def execute_query(request: Request, query_request: QueryRequest):
             output = io.StringIO()
             plots: List[str] = []
 
+            # Get variable context from request if provided
+            variable_context = {}
+            if hasattr(query_request, 'variableContext') and query_request.variableContext:
+                variable_context = query_request.variableContext
+                logger.info(f"Received variable context with {len(variable_context)} variables")
+
             # Prepare the execution environment with enhanced capabilities
             local_ns = {
                 # Core libraries
@@ -504,13 +659,57 @@ async def execute_query(request: Request, query_request: QueryRequest):
                 'datetime': __import__('datetime'),
                 're': __import__('re'),
 
+                # Computer Vision libraries (only available ones)
+                'PIL': __import__('PIL'),
+                'Image': __import__('PIL.Image', fromlist=['Image']).Image,
+                'ImageDraw': __import__('PIL.ImageDraw', fromlist=['ImageDraw']).ImageDraw,
+                'ImageFont': __import__('PIL.ImageFont', fromlist=['ImageFont']).ImageFont,
+                'requests': __import__('requests'),
+                'base64': __import__('base64'),
+                'urllib': __import__('urllib'),
+
+                # Streamlit (for interactive apps)
+                'streamlit': __import__('streamlit'),
+                'st': __import__('streamlit'),
+
+                # Variable context from previous cells
+                **variable_context,
+
                 # Utilities
                 'describe': lambda x: pd.DataFrame(x.describe()),
                 'get_plot': lambda: PlotManager.get_plot_as_base64(),  # Make it a function call
                 'analyzer': DataAnalyzer(),
                 'available_columns': list(datasets.get('df', pd.DataFrame()).columns) if datasets else [],
-                
-                # Dataset paths for reference
+
+                # Image and URL utilities
+                'show_image': lambda url: plots.append(url) if url.startswith(('http', 'data:')) else None,
+
+                # Streamlit Community Cloud URL generators
+                'generate_streamlit_url': lambda username="streamlit", repo="demo-uber-nyc-pickups", branch="main", app_file="streamlit_app": f"https://{username}-{repo}-{branch}-{app_file.replace('.py', '').replace('_', '')}.streamlit.app",
+                'create_demo_url': lambda app_name="30days": f"https://{app_name}.streamlit.app",  # Popular demo apps
+                'get_gallery_app': lambda app_name="30days": f"https://{app_name}.streamlit.app",  # Gallery apps
+
+                # Popular working Streamlit apps for demo
+                'get_random_streamlit_app': lambda: random.choice([
+                    "https://30days.streamlit.app",  # 30 Days of Streamlit
+                    "https://streamlit-example-app-calculating-user-growth.streamlit.app",  # User Growth Calculator
+                    "https://share.streamlit.io/streamlit/demo-uber-nyc-pickups/main/streamlit_app.py",  # Uber NYC Pickups
+                    "https://share.streamlit.io/streamlit/demo-self-driving/main/streamlit_app.py",  # Self Driving Demo
+                    "https://streamlit-example-app-iris-eda.streamlit.app",  # Iris EDA
+                ]),
+
+                # Create embeddable Streamlit URL with proper embed parameters
+                'create_streamlit_embed': lambda url: f"{url}?embed=true&embed_options=hide_loading_screen&embed_options=show_toolbar" if not "embed=true" in url else url,
+
+                # Helper to create a complete Streamlit app result with both embed and open URLs
+                'streamlit_app': lambda url_or_name="30days": {
+                    'embed_url': f"https://{url_or_name}.streamlit.app?embed=true&embed_options=hide_loading_screen" if not url_or_name.startswith('http') else f"{url_or_name}?embed=true&embed_options=hide_loading_screen",
+                    'open_url': f"https://{url_or_name}.streamlit.app" if not url_or_name.startswith('http') else url_or_name.split('?')[0],
+                    'type': 'streamlit_app'
+                },
+
+                # Function to create and run live Streamlit app from current code
+                'run_streamlit_app': lambda: create_streamlit_app(code, f"cell_{hash(code) % 10000}"),
                 'available_datasets': list(dataset_paths.keys()) if dataset_paths else [],
                 
                 # Debug function to show available datasets
@@ -628,11 +827,21 @@ async def execute_query(request: Request, query_request: QueryRequest):
             
             # Override pandas read functions with our custom ones
             local_ns['pd'].read_csv = custom_read_csv
-            
+
             # Also add them directly to the namespace
             local_ns['read_csv'] = custom_read_csv
 
-            # Execute the code with Jupyter-like behavior
+            # Override file saving functions to prevent saving in backend directory
+            def safe_save_warning(*args, **kwargs):
+                print("⚠️  File saving is disabled in hosted environment. Use URLs or data URIs instead.")
+                return None
+
+            # Override common save functions
+            local_ns['plt'].savefig = safe_save_warning
+            if 'cv2' in local_ns:
+                local_ns['cv2'].imwrite = safe_save_warning
+
+            # Execute the code with Jupyter-like behavior and real-time output
             with redirect_stdout(output):
                 try:
                     # Split the code into cells like Jupyter
@@ -640,16 +849,120 @@ async def execute_query(request: Request, query_request: QueryRequest):
                     if len(code_cells) == 1:  # No cell markers, treat as single cell
                         code_cells = [query_request.query]
 
-                    # Execute each cell
+                    # Initialize cell_results for all execution paths
                     cell_results = []
-                    for i, cell in enumerate(code_cells):
-                        if not cell.strip():
-                            continue
 
-                        print(f"Executing cell {i+1}..." if len(code_cells) > 1 else "Executing code...")
+                    # Check if this is Streamlit code
+                    full_code = query_request.query
+                    is_streamlit_code = ('import streamlit' in full_code or
+                                       'from streamlit' in full_code or
+                                       'st.' in full_code)
 
-                        # Execute the cell
-                        exec(cell, {}, local_ns)
+                    if is_streamlit_code:
+                        # Create and run a live Streamlit app
+                        app_id = f"cell_{hash(full_code) % 10000}"
+                        print("🎈 Detected Streamlit code - Creating live app...")
+                        print(f"📝 Code preview:\n{full_code[:200]}{'...' if len(full_code) > 200 else ''}")
+
+                        streamlit_result = create_streamlit_app(full_code, app_id)
+
+                        if streamlit_result['type'] == 'streamlit_app':
+                            plots.append(json.dumps(streamlit_result))
+                            print(f"✅ Live Streamlit app created successfully!")
+                            print(f"🌐 App URL: {streamlit_result['open_url']}")
+                            print(f"📱 App ID: {app_id}")
+                            print(f"🔗 Embed URL: {streamlit_result['embed_url']}")
+                            print(f"📊 App Status: Running")
+                            print(f"🏠 Host Type: {streamlit_result.get('host_type', 'local')}")
+                            print(f"🎯 Interactive features: Enabled")
+                            print(f"💾 Save to dashboard: Available")
+                            print(f"")
+                            print(f"🎈 Your Streamlit app is now live and interactive!")
+                            print(f"   You can interact with widgets, upload files, and see real-time updates.")
+                            print(f"   The app will continue running until you stop it or restart the server.")
+                            if streamlit_result.get('host_type') == 'cloud':
+                                print(f"   🌐 Running in cloud mode - URLs are configured for your deployment environment.")
+
+                            # Set a result for Streamlit apps - this will show in output
+                            streamlit_info = {
+                                'type': 'streamlit_app_info',
+                                'url': streamlit_result['open_url'],
+                                'embed_url': streamlit_result['embed_url'],
+                                'app_id': app_id,
+                                'status': 'running',
+                                'message': f"Streamlit app is running at {streamlit_result['open_url']}",
+                                'features': ['Interactive widgets', 'File uploads', 'Real-time updates', 'Data visualization'],
+                                'actions': ['Open in new tab', 'Save to dashboard', 'Stop app']
+                            }
+                            cell_results.append(streamlit_info)
+
+                            # Also add to local namespace so it can be accessed
+                            local_ns['streamlit_app_info'] = streamlit_info
+                            local_ns['app_url'] = streamlit_result['open_url']
+                            local_ns['result'] = streamlit_info
+
+                        else:
+                            print(f"❌ Failed to create Streamlit app: {streamlit_result['message']}")
+                            error_info = {
+                                'type': 'streamlit_error',
+                                'message': streamlit_result['message'],
+                                'status': 'failed'
+                            }
+                            cell_results.append(error_info)
+                            local_ns['result'] = error_info
+                    else:
+                        # Execute each cell normally
+                        for i, cell in enumerate(code_cells):
+                            if not cell.strip():
+                                continue
+
+                            print(f"Executing cell {i+1}..." if len(code_cells) > 1 else "Executing code...")
+
+                            # Execute the cell
+                            exec(cell, {}, local_ns)
+
+                            # Check for image URLs or Streamlit URLs in result
+                            if 'result' in local_ns:
+                                result_val = local_ns.get('result')
+
+                                # Handle Streamlit app objects (dict with embed_url, open_url, type)
+                                if isinstance(result_val, dict) and result_val.get('type') == 'streamlit_app':
+                                    # Create a special Streamlit app plot entry
+                                    streamlit_data = {
+                                        'type': 'streamlit_app',
+                                        'embed_url': result_val.get('embed_url'),
+                                        'open_url': result_val.get('open_url'),
+                                        'title': f"Streamlit App"
+                                    }
+                                    plots.append(json.dumps(streamlit_data))
+                                    print(f"Streamlit app captured: {result_val.get('open_url')}")
+
+                            elif isinstance(result_val, str):
+                                # Handle image URLs
+                                if result_val.startswith(('http', 'https')) and any(ext in result_val.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+                                    plots.append(result_val)
+                                    print(f"Image URL captured: {result_val}")
+                                # Handle Streamlit URLs
+                                elif 'streamlit' in result_val.lower() or result_val.startswith('http') and ('8501' in result_val or '.streamlit.app' in result_val):
+                                    # Convert to proper Streamlit app object
+                                    embed_url = result_val if '?embed=true' in result_val else f"{result_val}?embed=true&embed_options=hide_loading_screen"
+                                    open_url = result_val.split('?')[0]  # Remove query params for open URL
+
+                                    streamlit_data = {
+                                        'type': 'streamlit_app',
+                                        'embed_url': embed_url,
+                                        'open_url': open_url,
+                                        'title': f"Streamlit App"
+                                    }
+                                    plots.append(json.dumps(streamlit_data))
+                                    print(f"Streamlit URL captured: {open_url}")
+                                # Handle data URLs
+                                elif result_val.startswith('data:'):
+                                    plots.append(result_val)
+                                    print(f"Data URL captured")
+
+                        # Flush output for real-time display
+                        output.flush()
 
                         # Capture any plots created in this cell
                         if plt.get_fignums():
@@ -676,10 +989,10 @@ async def execute_query(request: Request, query_request: QueryRequest):
                                 print(f"Error capturing plot: {str(plot_error)}")
                             # plt.close('all') is already called in get_plot_as_base64
 
-                        # Get the result from this cell
-                        cell_result = local_ns.get('result')
-                        if cell_result is not None:
-                            cell_results.append(cell_result)
+                            # Get the result from this cell
+                            cell_result = local_ns.get('result')
+                            if cell_result is not None:
+                                cell_results.append(cell_result)
 
                     # Use the last cell's result as the final result
                     result = cell_results[-1] if cell_results else None
@@ -693,13 +1006,47 @@ async def execute_query(request: Request, query_request: QueryRequest):
                             plots.append(result)
                             print("Added result plot to plots array")
 
+                    # Extract variables from the execution namespace for persistence
+                    extracted_variables = {}
+                    variable_types = {}
+                    for var_name, var_value in local_ns.items():
+                        # Skip built-in functions, modules, and special variables
+                        if (not var_name.startswith('_') and
+                            var_name not in ['pd', 'np', 'plt', 'sns', 'os', 'sys', 'io', 'json', 'datetime', 're',
+                                           'cv2', 'mediapipe', 'cvzone', 'PIL', 'Image', 'ImageDraw', 'ImageFont',
+                                           'imageio', 'skimage', 'streamlit', 'st', 'describe', 'get_plot', 'analyzer',
+                                           'available_columns', 'available_datasets', 'import_module', 'read_csv'] and
+                            not callable(var_value) and
+                            not hasattr(var_value, '__module__')):
+
+                            try:
+                                # Try to serialize the variable to check if it's JSON-serializable
+                                if isinstance(var_value, (str, int, float, bool, list, dict)):
+                                    extracted_variables[var_name] = var_value
+                                    variable_types[var_name] = type(var_value).__name__
+                                elif isinstance(var_value, pd.DataFrame):
+                                    # Store DataFrame info but not the actual data (too large)
+                                    variable_types[var_name] = 'DataFrame'
+                                    extracted_variables[var_name] = f"DataFrame({var_value.shape[0]}x{var_value.shape[1]})"
+                                elif isinstance(var_value, np.ndarray):
+                                    variable_types[var_name] = 'ndarray'
+                                    extracted_variables[var_name] = f"ndarray{var_value.shape}"
+                                else:
+                                    variable_types[var_name] = type(var_value).__name__
+                                    extracted_variables[var_name] = str(var_value)[:100]  # Truncate long strings
+                            except Exception:
+                                # Skip variables that can't be serialized
+                                pass
+
                     # Format the response
                     response_data = {
                         "data": None,
                         "output": output.getvalue(),
                         "plots": plots,
                         "error": None,
-                        "isSuccess": True
+                        "isSuccess": True,
+                        "variables": extracted_variables,
+                        "variableTypes": variable_types
                     }
 
                     if result is not None:
@@ -751,6 +1098,9 @@ async def execute_query(request: Request, query_request: QueryRequest):
                             response_data["data"] = [{"result": str(result)}]
                             response_data["error"] = f"Warning: Could not properly format result: {str(e)}"
 
+                    # Add the result to the response
+                    response_data["result"] = result
+
                     # Use the custom JSON encoder for the response
                     # We don't return this directly, but convert it to a dict that FastAPI will serialize
                     try:
@@ -764,6 +1114,7 @@ async def execute_query(request: Request, query_request: QueryRequest):
                             "data": [{"result": "Data contains values that cannot be serialized to JSON"}],
                             "output": output.getvalue(),
                             "plots": plots,
+                            "result": str(result) if result is not None else None,
                             "error": f"Warning: Result contains values that cannot be serialized to JSON: {str(json_error)}",
                             "isSuccess": True
                         }
@@ -776,6 +1127,7 @@ async def execute_query(request: Request, query_request: QueryRequest):
                         "data": None,
                         "output": output.getvalue(),
                         "plots": plots,
+                        "result": None,
                         "error": error_msg,
                         "isSuccess": False
                     }
@@ -824,6 +1176,41 @@ async def execute_query(request: Request, query_request: QueryRequest):
 async def root():
     return {"message": "FastAPI server is running"}
 
+@app.post("/api/cleanup-streamlit")
+async def cleanup_streamlit(request: Request):
+    """Clean up a Streamlit app"""
+    try:
+        body = await request.json()
+        app_id = body.get('app_id')
+
+        if not app_id:
+            raise HTTPException(status_code=400, detail="app_id is required")
+
+        cleanup_streamlit_app(app_id)
+        return {"message": f"Streamlit app {app_id} cleaned up successfully"}
+
+    except Exception as e:
+        logger.error(f"Error cleaning up Streamlit app: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/streamlit-status")
+async def streamlit_status():
+    """Get status of all running Streamlit apps"""
+    try:
+        status = {}
+        for app_id, app_info in streamlit_processes.items():
+            process = app_info['process']
+            status[app_id] = {
+                'port': app_info['port'],
+                'running': process.poll() is None,
+                'url': f"http://localhost:{app_info['port']}"
+            }
+        return {"apps": status}
+
+    except Exception as e:
+        logger.error(f"Error getting Streamlit status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": str(pd.Timestamp.now())}
@@ -831,3 +1218,4 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+
