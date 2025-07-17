@@ -921,6 +921,9 @@ async def execute_query(request: Request, query_request: QueryRequest):
                             # Execute the cell
                             exec(cell, {}, local_ns)
 
+                            # Initialize result_val to None before checking for results
+                            result_val = None
+                            
                             # Check for image URLs or Streamlit URLs in result
                             if 'result' in local_ns:
                                 result_val = local_ns.get('result')
@@ -936,30 +939,30 @@ async def execute_query(request: Request, query_request: QueryRequest):
                                     }
                                     plots.append(json.dumps(streamlit_data))
                                     print(f"Streamlit app captured: {result_val.get('open_url')}")
+                                
+                                elif isinstance(result_val, str):
+                                    # Handle image URLs
+                                    if result_val.startswith(('http', 'https')) and any(ext in result_val.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+                                        plots.append(result_val)
+                                        print(f"Image URL captured: {result_val}")
+                                    # Handle Streamlit URLs
+                                    elif 'streamlit' in result_val.lower() or result_val.startswith('http') and ('8501' in result_val or '.streamlit.app' in result_val):
+                                        # Convert to proper Streamlit app object
+                                        embed_url = result_val if '?embed=true' in result_val else f"{result_val}?embed=true&embed_options=hide_loading_screen"
+                                        open_url = result_val.split('?')[0]  # Remove query params for open URL
 
-                            elif isinstance(result_val, str):
-                                # Handle image URLs
-                                if result_val.startswith(('http', 'https')) and any(ext in result_val.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
-                                    plots.append(result_val)
-                                    print(f"Image URL captured: {result_val}")
-                                # Handle Streamlit URLs
-                                elif 'streamlit' in result_val.lower() or result_val.startswith('http') and ('8501' in result_val or '.streamlit.app' in result_val):
-                                    # Convert to proper Streamlit app object
-                                    embed_url = result_val if '?embed=true' in result_val else f"{result_val}?embed=true&embed_options=hide_loading_screen"
-                                    open_url = result_val.split('?')[0]  # Remove query params for open URL
-
-                                    streamlit_data = {
-                                        'type': 'streamlit_app',
-                                        'embed_url': embed_url,
-                                        'open_url': open_url,
-                                        'title': f"Streamlit App"
-                                    }
-                                    plots.append(json.dumps(streamlit_data))
-                                    print(f"Streamlit URL captured: {open_url}")
-                                # Handle data URLs
-                                elif result_val.startswith('data:'):
-                                    plots.append(result_val)
-                                    print(f"Data URL captured")
+                                        streamlit_data = {
+                                            'type': 'streamlit_app',
+                                            'embed_url': embed_url,
+                                            'open_url': open_url,
+                                            'title': f"Streamlit App"
+                                        }
+                                        plots.append(json.dumps(streamlit_data))
+                                        print(f"Streamlit URL captured: {open_url}")
+                                    # Handle data URLs
+                                    elif result_val.startswith('data:'):
+                                        plots.append(result_val)
+                                        print(f"Data URL captured")
 
                         # Flush output for real-time display
                         output.flush()
