@@ -123,7 +123,9 @@ class JupyterKernel:
         def custom_show(*args, **kwargs):
             # Don't actually show (since we're in non-interactive mode)
             # The plots will be captured later by capture_plots()
-            pass
+            # Just ensure the current figure is properly finalized
+            if plt.get_fignums():
+                plt.tight_layout()
 
         plt.show = custom_show
         self.namespace['plt'].show = custom_show
@@ -260,6 +262,21 @@ class JupyterKernel:
             try:
                 fig = plt.figure(fig_num)
 
+                # Check if figure has any content (axes with data)
+                if not fig.get_axes():
+                    continue  # Skip empty figures
+
+                # Check if any axes have content
+                has_content = False
+                for ax in fig.get_axes():
+                    if (ax.lines or ax.patches or ax.collections or
+                        ax.images or ax.texts or ax.get_children()):
+                        has_content = True
+                        break
+
+                if not has_content:
+                    continue  # Skip figures without content
+
                 # Save figure to buffer
                 buffer = BytesIO()
                 fig.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
@@ -275,7 +292,7 @@ class JupyterKernel:
             except Exception as e:
                 print(f"Error capturing plot {fig_num}: {e}")
 
-        # Close all figures
+        # Close all figures to prevent accumulation
         plt.close('all')
 
         return plots

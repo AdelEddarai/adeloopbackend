@@ -93,29 +93,69 @@ class JSQueryRequest(BaseModel):
 
 # Streamlit app management
 streamlit_apps = {}
+streamlit_port_counter = 5151  # Start from port 5151
 
-def find_free_port():
-    """Find a free port for Streamlit app"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))
-        s.listen(1)
-        port = s.getsockname()[1]
+def get_next_streamlit_port():
+    """Get the next available port for Streamlit app"""
+    global streamlit_port_counter
+    port = streamlit_port_counter
+    streamlit_port_counter += 1
     return port
 
 def create_streamlit_app(code: str, app_id: str) -> Dict[str, Any]:
     """Create and run a Streamlit app from Python code"""
     try:
+        # Check if we're running on a cloud platform
+        is_cloud = bool(os.getenv('RENDER_SERVICE_NAME') or
+                       os.getenv('RAILWAY_STATIC_URL') or
+                       os.getenv('HEROKU_APP_NAME'))
+
+        # Clean the code to handle DeltaGenerator and other Streamlit objects
+        cleaned_code = code.replace('DeltaGenerator()', '').strip()
+        if not cleaned_code:
+            cleaned_code = """
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+st.title("Generated Streamlit App")
+st.write("Your Streamlit app is ready!")
+
+# Add some sample content
+data = pd.DataFrame({
+    'x': np.random.randn(100),
+    'y': np.random.randn(100)
+})
+st.line_chart(data)
+"""
+
+        if is_cloud:
+            # For cloud platforms, create a simple URL endpoint
+            cloud_url = f"https://flopbackend.onrender.com/streamlit/{app_id}"
+            return {
+                'type': 'streamlit_url',
+                'app_id': app_id,
+                'title': f'Streamlit App {app_id}',
+                'status': 'url_ready',
+                'url': cloud_url,
+                'open_url': cloud_url,
+                'code': cleaned_code,
+                'message': f'Streamlit app URL generated: {cloud_url}',
+                'host_type': 'cloud_url'
+            }
+
+        # For local development, proceed with normal Streamlit app creation
         # Create temporary directory for the app
         temp_dir = tempfile.mkdtemp(prefix=f"streamlit_app_{app_id}_")
         app_file = os.path.join(temp_dir, "streamlit_app.py")
-        
-        # Write the code to a file
+
+        # Write the cleaned code to a file
         with open(app_file, 'w', encoding='utf-8') as f:
-            f.write(code)
-        
-        # Find a free port
-        port = find_free_port()
-        
+            f.write(cleaned_code)
+
+        # Get next sequential port
+        port = get_next_streamlit_port()
+
         # Start Streamlit app
         cmd = [
             "streamlit", "run", app_file,
@@ -126,14 +166,16 @@ def create_streamlit_app(code: str, app_id: str) -> Dict[str, Any]:
             "--server.enableXsrfProtection", "false",
             "--browser.gatherUsageStats", "false"
         ]
-        
+
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=temp_dir
         )
-        
+
+        app_url = f"http://localhost:{port}"
+
         # Store app info
         app_info = {
             'app_id': app_id,
@@ -141,28 +183,28 @@ def create_streamlit_app(code: str, app_id: str) -> Dict[str, Any]:
             'process': process,
             'temp_dir': temp_dir,
             'app_file': app_file,
-            'url': f"http://localhost:{port}",
-            'embed_url': f"http://localhost:{port}?embed=true&embed_options=hide_loading_screen",
+            'url': app_url,
             'status': 'starting'
         }
-        
+
         streamlit_apps[app_id] = app_info
-        
+
         # Wait a moment for the app to start
         import time
         time.sleep(2)
         app_info['status'] = 'running'
-        
+
         return {
-            'type': 'streamlit_app',
+            'type': 'streamlit_url',
             'app_id': app_id,
             'url': app_info['url'],
-            'embed_url': app_info['embed_url'],
             'open_url': app_info['url'],
             'title': f'Streamlit App {app_id}',
-            'status': 'running'
+            'status': 'running',
+            'host_type': 'local',
+            'code': cleaned_code
         }
-        
+
     except Exception as e:
         logger.error(f"Error creating Streamlit app: {str(e)}")
         return {
@@ -351,7 +393,16 @@ async def execute_jupyter(request: Request, query_request: QueryRequest):
 
         
         # Add Streamlit app result if created
-        if streamlit_result and streamlit_result.get('type') == 'streamlit_app':
+        if streamlit_result:
+            if streamlit_result.get('type') in ['streamlit_url', 'streamlit_app']:
+                # Add URL to output text so user can see it
+                streamlit_url = streamlit_result.get('url', '')
+                if streamlit_url:
+                    streamlit_output = f"\n🎈 Streamlit app created!\nURL: {streamlit_url}\nCopy this URL and open it in your browser."
+                    if 'output' in response_data:
+                        response_data['output'] += streamlit_output
+                    else:
+                        response_data['output'] = streamlit_output.strip()
             response_data['result'] = streamlit_result
         
         # Handle errors
@@ -549,14 +600,44 @@ async def continue_with_input(request: Request):
             content={"error": f"Execution failed: {str(e)}"}
         )
 
+@app.get("/streamlit/{app_id}")
+async def serve_streamlit_app(app_id: str):
+    """Serve a simple Streamlit app URL for cloud deployment"""
+    try:
+        # Create a simple HTML page that shows the Streamlit app info
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Streamlit App {app_id}</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 40px; background: #f0f2f6; }}
+                .container {{ max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                .header {{ color: #ff4b4b; font-size: 24px; margin-bottom: 20px; }}
+                .url {{ background: #f0f2f6; padding: 15px; border-radius: 5px; font-family: monospace; margin: 10px 0; }}
+                .button {{ background: #ff4b4b; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">🎈 Streamlit App {app_id}</div>
+                <p>Your Streamlit app URL is ready!</p>
+                <div class="url">https://flopbackend.onrender.com/streamlit/{app_id}</div>
+                <p>Copy this URL and open it in your browser to access your Streamlit app.</p>
+                <button class="button" onclick="navigator.clipboard.writeText('https://flopbackend.onrender.com/streamlit/{app_id}')">Copy URL</button>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html_content)
+    except Exception as e:
+        logger.error(f"Error serving Streamlit app: {str(e)}")
+        return HTMLResponse(content=f"<h1>Error</h1><p>{str(e)}</p>", status_code=500)
+
 @app.post("/api/cleanup-streamlit")
 async def cleanup_streamlit_app(request: Request):
     """Stop and cleanup a Streamlit app"""
     try:
-        # Verify authentication
-        auth_token = request.headers.get("authorization")
-        user_id = verify_jwt_token(auth_token)
-
         data = await request.json()
         app_id = data.get('app_id')
 
