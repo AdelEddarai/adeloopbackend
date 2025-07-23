@@ -11,6 +11,9 @@ python-dotenv
 pyjwt
 requests
 psutil
+ipython
+jupyter
+kaleido
 
 # Computer Vision Libraries
 mediapipe

@@ -178,11 +178,19 @@ class JupyterKernel:
             sys.stderr = old_stderr
             import plotly.offline as pyo
 
-            # Set Plotly to not show plots in browser
-            pio.renderers.default = "json"
+            # Set Plotly to not show plots in browser and handle missing ipython
+            try:
+                pio.renderers.default = "json"
+            except Exception:
+                # Fallback if ipython is not available
+                pio.renderers.default = "browser"
 
             # Disable auto-opening in browser
-            pyo.init_notebook_mode(connected=False)
+            try:
+                pyo.init_notebook_mode(connected=False)
+            except Exception:
+                # Handle case where ipython is not available
+                pass
 
             # Store original show method
             self._original_plotly_show = go.Figure.show
@@ -190,11 +198,25 @@ class JupyterKernel:
 
             def custom_plotly_show(fig_self, *args, **kwargs):
                 try:
-                    # Capture the figure data as JSON
-                    fig_json = fig_self.to_json()
-                    kernel_instance._plotly_figures.append(fig_json)
-                except Exception:
-                    # Silently ignore errors in figure capture
+                    # Generate HTML output that can be displayed directly
+                    fig_html = fig_self.to_html(
+                        include_plotlyjs='inline',
+                        div_id=f"plotly-div-{len(kernel_instance._plotly_figures)}",
+                        config={
+                            'displayModeBar': True,
+                            'displaylogo': False,
+                            'modeBarButtonsToRemove': ['pan2d', 'lasso2d', 'select2d'],
+                            'responsive': True
+                        }
+                    )
+                    kernel_instance._plotly_figures.append(fig_html)
+
+                    # Debug info
+                    title = fig_self.layout.title.text if fig_self.layout.title else 'Untitled Plot'
+                    print(f"📊 Plotly figure captured as HTML: {title}")
+
+                except Exception as e:
+                    print(f"❌ Failed to capture Plotly figure: {str(e)}")
                     pass
                 # Don't actually show in browser
                 pass
@@ -259,24 +281,21 @@ class JupyterKernel:
         return plots
 
     def capture_plotly_figures(self) -> List[str]:
-        """Capture all Plotly figures as JSON"""
+        """Capture all Plotly figures as HTML for direct display"""
         plotly_plots = []
 
         if hasattr(self, '_plotly_figures'):
-            for fig_json in self._plotly_figures:
+            for fig_html in self._plotly_figures:
                 try:
-                    # Parse the JSON to ensure it's valid
-                    import json
-                    fig_data = json.loads(fig_json)
+                    # The figure is already HTML, just add it to the plots
+                    if isinstance(fig_html, str) and '<div' in fig_html:
+                        plotly_plots.append(fig_html)
+                        print(f"✅ Plotly HTML figure ready for frontend")
+                    else:
+                        print(f"⚠️ Plotly figure is not valid HTML: {type(fig_html)}")
 
-                    # Format as expected by frontend - wrap in proper structure
-                    formatted_plot = {
-                        'application/vnd.plotly.v1+json': fig_data,
-                        'text/html': f'<div id="plotly-div">{fig_json}</div>'
-                    }
-                    plotly_plots.append(json.dumps(formatted_plot))
-                except Exception:
-                    # Silently ignore Plotly processing errors
+                except Exception as e:
+                    print(f"❌ Error processing Plotly figure: {str(e)}")
                     pass
 
             # Clear the figures for next execution
@@ -387,6 +406,34 @@ class JupyterKernel:
         else:
             return df.to_html(classes='dataframe', table_id='dataframe')
     
+    def _preprocess_code(self, code: str) -> str:
+        """Preprocess code to handle Streamlit commands and other issues"""
+        lines = code.split('\n')
+        processed_lines = []
+
+        for line in lines:
+            line_stripped = line.strip()
+
+            # Skip or modify Streamlit commands
+            if (line_stripped.startswith('st.') or
+                'streamlit' in line_stripped.lower() or
+                line_stripped.startswith('import streamlit') or
+                line_stripped.startswith('from streamlit') or
+                '.st.' in line_stripped or
+                'st(' in line_stripped):
+                # Comment out Streamlit commands
+                processed_lines.append(f"# {line}  # Streamlit command - not supported in this context")
+                continue
+
+            # Handle _repr_html_ calls that might cause issues
+            if '_repr_html_()' in line_stripped:
+                processed_lines.append(f"# {line}  # _repr_html_ call - handled separately")
+                continue
+
+            processed_lines.append(line)
+
+        return '\n'.join(processed_lines)
+
     def execute_code(self, code: str, datasets: Optional[List[Dict]] = None) -> Dict[str, Any]:
         """
         Execute Python code and return Jupyter-like results
@@ -406,6 +453,9 @@ class JupyterKernel:
         """
         
         self.execution_count += 1
+
+        # Preprocess code to handle Streamlit and other issues
+        processed_code = self._preprocess_code(code)
         
         # Add datasets to namespace
         if datasets:
@@ -460,7 +510,15 @@ class JupyterKernel:
                         if isinstance(result, pd.DataFrame):
                             html_outputs.append(self.format_dataframe_html(result))
                         elif hasattr(result, '_repr_html_'):
-                            html_outputs.append(result._repr_html_())
+                            try:
+                                html_outputs.append(result._repr_html_())
+                            except Exception as e:
+                                # Handle Streamlit objects that don't work in this context
+                                if 'streamlit' in str(type(result)).lower() or '_repr_html_' in str(e):
+                                    # Skip Streamlit objects - they need to run in Streamlit context
+                                    pass
+                                else:
+                                    html_outputs.append(f"<div>Error rendering HTML: {str(e)}</div>")
                         # Don't show None results
                         elif result is None:
                             result = None
