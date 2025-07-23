@@ -94,6 +94,7 @@ class JSQueryRequest(BaseModel):
 # Streamlit app management
 streamlit_apps = {}
 streamlit_port_counter = 5151  # Start from port 5151
+streamlit_code_storage = {}  # Store Streamlit code by app_id
 
 def get_next_streamlit_port():
     """Get the next available port for Streamlit app"""
@@ -130,6 +131,9 @@ st.line_chart(data)
 """
 
         if is_cloud:
+            # Store the code for the cloud endpoint
+            streamlit_code_storage[app_id] = cleaned_code
+
             # For cloud platforms, create a simple URL endpoint
             cloud_url = f"https://flopbackend.onrender.com/streamlit/{app_id}"
             return {
@@ -602,34 +606,77 @@ async def continue_with_input(request: Request):
 
 @app.get("/streamlit/{app_id}")
 async def serve_streamlit_app(app_id: str):
-    """Serve a simple Streamlit app URL for cloud deployment"""
+    """Serve Streamlit app code for cloud deployment"""
     try:
-        # Create a simple HTML page that shows the Streamlit app info
-        html_content = f"""
+        # Get the stored code for this app
+        if app_id in streamlit_code_storage:
+            streamlit_code = streamlit_code_storage[app_id]
+        else:
+            # Default Streamlit app
+            streamlit_code = """
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+st.title("Generated Streamlit App")
+st.write("Your Streamlit app is ready!")
+
+# Add some sample content
+data = pd.DataFrame({
+    'x': np.random.randn(100),
+    'y': np.random.randn(100)
+})
+st.line_chart(data)
+"""
+
+        # Return HTML page with the code and instructions
+        return HTMLResponse(content=f"""
         <!DOCTYPE html>
         <html>
         <head>
             <title>Streamlit App {app_id}</title>
             <style>
-                body {{ font-family: Arial, sans-serif; margin: 40px; background: #f0f2f6; }}
-                .container {{ max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                body {{ font-family: Arial, sans-serif; margin: 20px; background: #f0f2f6; }}
+                .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
                 .header {{ color: #ff4b4b; font-size: 24px; margin-bottom: 20px; }}
-                .url {{ background: #f0f2f6; padding: 15px; border-radius: 5px; font-family: monospace; margin: 10px 0; }}
+                .code {{ background: #f8f9fa; padding: 20px; border-radius: 5px; font-family: monospace; margin: 20px 0; white-space: pre-wrap; border: 1px solid #e9ecef; }}
                 .button {{ background: #ff4b4b; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px; }}
+                .instructions {{ background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 20px 0; border-left: 4px solid #007bff; }}
             </style>
         </head>
         <body>
             <div class="container">
                 <div class="header">🎈 Streamlit App {app_id}</div>
-                <p>Your Streamlit app URL is ready!</p>
-                <div class="url">https://flopbackend.onrender.com/streamlit/{app_id}</div>
-                <p>Copy this URL and open it in your browser to access your Streamlit app.</p>
-                <button class="button" onclick="navigator.clipboard.writeText('https://flopbackend.onrender.com/streamlit/{app_id}')">Copy URL</button>
+
+                <div class="instructions">
+                    <h3>📋 How to run this Streamlit app:</h3>
+                    <ol>
+                        <li>Copy the code below</li>
+                        <li>Save it as <code>app.py</code> on your local machine</li>
+                        <li>Run: <code>streamlit run app.py</code></li>
+                        <li>Or deploy to <a href="https://share.streamlit.io/" target="_blank">Streamlit Cloud</a></li>
+                    </ol>
+                </div>
+
+                <h3>📄 Streamlit Code:</h3>
+                <div class="code">{streamlit_code}</div>
+
+                <button class="button" onclick="copyCode()">📋 Copy Code</button>
+                <button class="button" onclick="window.open('https://share.streamlit.io/', '_blank')">🚀 Deploy to Streamlit Cloud</button>
             </div>
+
+            <script>
+                function copyCode() {{
+                    const code = `{streamlit_code}`;
+                    navigator.clipboard.writeText(code).then(() => {{
+                        alert('Code copied to clipboard!');
+                    }});
+                }}
+            </script>
         </body>
         </html>
-        """
-        return HTMLResponse(content=html_content)
+        """)
+
     except Exception as e:
         logger.error(f"Error serving Streamlit app: {str(e)}")
         return HTMLResponse(content=f"<h1>Error</h1><p>{str(e)}</p>", status_code=500)

@@ -44,6 +44,9 @@ class JupyterKernel:
     def __init__(self):
         self.namespace = {}
         self.execution_count = 0
+        # Create temp directory for CSV files
+        import tempfile
+        self.temp_dir = tempfile.mkdtemp(prefix="jupyter_kernel_")
         self.setup_namespace()
     
     def setup_namespace(self):
@@ -480,19 +483,28 @@ class JupyterKernel:
                 if dataset and 'data' in dataset:
                     df_data = pd.DataFrame(dataset['data'])
                     dataset_name = dataset.get('name', f'Dataset {i+1}')
-                    
+
                     # Create safe variable name
                     safe_name = dataset_name.lower().replace(' ', '_').replace('-', '_')
                     safe_name = ''.join(c for c in safe_name if c.isalnum() or c == '_')
                     if not safe_name or safe_name[0].isdigit():
                         safe_name = f'dataset_{safe_name}' if safe_name else f'dataset_{i+1}'
-                    
+
                     # Store datasets with multiple names for flexibility
                     self.namespace[safe_name] = df_data
                     self.namespace[f'df{i+1}'] = df_data
-                    
+
                     if i == 0:
                         self.namespace['df'] = df_data
+
+                    # Create virtual CSV files so pd.read_csv() works
+                    csv_filename = f"{dataset_name}.csv" if dataset_name else f"dataset{i+1}.csv"
+                    csv_path = os.path.join(self.temp_dir, csv_filename)
+                    df_data.to_csv(csv_path, index=False)
+
+                    # Also create numbered CSV files
+                    numbered_csv = os.path.join(self.temp_dir, f"dataset{i+1}.csv")
+                    df_data.to_csv(numbered_csv, index=False)
         
         # Capture stdout and stderr
         stdout_capture = io.StringIO()
@@ -503,6 +515,10 @@ class JupyterKernel:
         html_outputs = []
         
         try:
+            # Change to temp directory so CSV files can be found
+            old_cwd = os.getcwd()
+            os.chdir(self.temp_dir)
+
             # Redirect stdout and stderr
             with contextlib.redirect_stdout(stdout_capture), \
                  contextlib.redirect_stderr(stderr_capture):
@@ -571,6 +587,9 @@ class JupyterKernel:
                 'evalue': str(e),
                 'traceback': traceback.format_exc().split('\n')
             }
+        finally:
+            # Restore working directory
+            os.chdir(old_cwd)
         
         # Capture plots and display outputs
         plots = self.capture_plots()
@@ -606,15 +625,28 @@ class JupyterKernel:
         stdout_text = stdout_capture.getvalue()
         stderr_text = stderr_capture.getvalue()
 
+        # Handle DataFrame results for table display
+        table_result = None
+        if result is not None and isinstance(result, pd.DataFrame):
+            # Convert DataFrame to table format for frontend
+            table_result = {
+                'type': 'table',
+                'data': result.to_dict('records'),
+                'columns': [{'key': col, 'label': col} for col in result.columns],
+                'title': 'DataFrame Result'
+            }
+
         # Combine stdout with any expression results for complete output
         combined_output = stdout_text
-        if result is not None and not plotly_result:
+        if result is not None and not plotly_result and not table_result:
             # Add the result to the output if it's not already printed
             result_str = ""
             if isinstance(result, (str, int, float, bool)):
                 result_str = str(result)
             elif isinstance(result, (list, dict, tuple)):
                 result_str = repr(result)
+            elif isinstance(result, pd.DataFrame):
+                result_str = f"DataFrame with {result.shape[0]} rows and {result.shape[1]} columns"
             else:
                 result_str = str(result)
 
@@ -649,7 +681,7 @@ class JupyterKernel:
             'status': 'error' if error_info else 'ok',
             'stdout': combined_output,  # Use combined output for better display
             'stderr': stderr_text,
-            'result': plotly_result if plotly_result else result,
+            'result': table_result if table_result else (plotly_result if plotly_result else result),
             'plots': all_media,  # Include both plots and display outputs
             'html_outputs': html_outputs,
             'error': error_info,
@@ -678,6 +710,19 @@ class JupyterKernel:
         self.namespace.clear()
         self.execution_count = 0
         self.setup_namespace()
+
+    def cleanup(self):
+        """Clean up temporary files"""
+        try:
+            import shutil
+            if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+        except Exception as e:
+            print(f"Warning: Could not clean up temp directory: {e}")
+
+    def __del__(self):
+        """Cleanup when kernel is destroyed"""
+        self.cleanup()
 
 # Global kernel instance
 _kernel_instance = None
