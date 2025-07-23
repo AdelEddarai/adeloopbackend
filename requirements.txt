@@ -5,9 +5,12 @@ pandas
 numpy
 matplotlib
 seaborn
+plotly
 aiohttp
 python-dotenv
 pyjwt
+requests
+psutil
 
 # Computer Vision Libraries
 mediapipe
