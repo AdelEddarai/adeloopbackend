@@ -19,6 +19,7 @@ from fastapi.websockets import WebSocketState
 
 from services.kernel.kernel_manager import get_kernel, execute_code_with_kernel, reset_kernel
 from services.kernel.jupyter_kernel import InputRequiredException
+from utils.responses import CustomJSONEncoder  # Add this import
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.send_text(json.dumps({
         "type": "connection_established",
         "message": "Connected to Python kernel"
-    }))
+    }, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
     
     kernel = get_kernel()
     
@@ -61,7 +62,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps({
                     "type": "error",
                     "error": f"Unknown message type: {message['type']}"
-                }))
+                }, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
                 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
@@ -72,7 +73,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_text(json.dumps({
                 "type": "error",
                 "error": f"Server error: {str(e)}"
-            }))
+            }, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
     finally:
         logger.info("WebSocket connection closed")
 
@@ -90,7 +91,7 @@ async def handle_code_execution(websocket: WebSocket, message: Dict[str, Any], k
         await websocket.send_text(json.dumps({
             "type": "execution_start",
             "cell_id": cell_id
-        }))
+        }, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
         
         # Execute code using kernel manager
         result = execute_code_with_kernel(
@@ -119,7 +120,7 @@ async def handle_code_execution(websocket: WebSocket, message: Dict[str, Any], k
                 "traceback": result["error"].get("traceback", []) if isinstance(result["error"], dict) else []
             }
         
-        await websocket.send_text(json.dumps(response))
+        await websocket.send_text(json.dumps(response, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
         
     except InputRequiredException as e:
         # Handle input request
@@ -128,7 +129,7 @@ async def handle_code_execution(websocket: WebSocket, message: Dict[str, Any], k
             "type": "input_request",
             "prompt": e.prompt,
             "original_code": code
-        }))
+        }, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
         
     except Exception as e:
         logger.error(f"Execution error: {str(e)}")
@@ -140,7 +141,7 @@ async def handle_code_execution(websocket: WebSocket, message: Dict[str, Any], k
                 "message": str(e),
                 "traceback": traceback.format_exc().split('\n')
             }
-        }))
+        }, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
 
 async def handle_input_provision(websocket: WebSocket, message: Dict[str, Any], kernel):
     """Handle input provision for interactive execution"""
@@ -173,7 +174,7 @@ async def handle_input_provision(websocket: WebSocket, message: Dict[str, Any], 
                 "traceback": result["error"].get("traceback", []) if isinstance(result["error"], dict) else []
             }
         
-        await websocket.send_text(json.dumps(response))
+        await websocket.send_text(json.dumps(response, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
         
     except Exception as e:
         logger.error(f"Input provision error: {str(e)}")
@@ -185,7 +186,7 @@ async def handle_input_provision(websocket: WebSocket, message: Dict[str, Any], 
                 "message": str(e),
                 "traceback": traceback.format_exc().split('\n')
             }
-        }))
+        }, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
 
 async def handle_execution_cancellation(websocket: WebSocket, kernel):
     """Handle execution cancellation"""
@@ -196,14 +197,14 @@ async def handle_execution_cancellation(websocket: WebSocket, kernel):
         await websocket.send_text(json.dumps({
             "type": "execution_cancelled",
             "message": "Execution cancelled"
-        }))
+        }, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
         
     except Exception as e:
         logger.error(f"Cancellation error: {str(e)}")
         await websocket.send_text(json.dumps({
             "type": "error",
             "error": str(e)
-        }))
+        }, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
 
 async def handle_kernel_reset(websocket: WebSocket, kernel):
     """Handle kernel reset"""
@@ -214,11 +215,11 @@ async def handle_kernel_reset(websocket: WebSocket, kernel):
         await websocket.send_text(json.dumps({
             "type": "kernel_reset",
             "message": "Kernel reset successfully"
-        }))
+        }, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
         
     except Exception as e:
         logger.error(f"Kernel reset error: {str(e)}")
         await websocket.send_text(json.dumps({
             "type": "error",
             "error": str(e)
-        }))
+        }, cls=CustomJSONEncoder))  # Use CustomJSONEncoder
