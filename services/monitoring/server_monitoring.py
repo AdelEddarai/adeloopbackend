@@ -14,6 +14,7 @@ import os
 import platform
 import subprocess
 import pkg_resources
+import time
 from datetime import datetime
 from typing import Dict, Any, List
 import logging
@@ -52,12 +53,24 @@ def get_cpu_info() -> Dict[str, Any]:
         Dictionary containing CPU metrics
     """
     try:
-        cpu_percent = psutil.cpu_percent(interval=1)
+        # Use non-blocking CPU measurement for better performance
+        cpu_percent = psutil.cpu_percent(interval=None)  # Non-blocking
         cpu_count = psutil.cpu_count()
-        cpu_freq = psutil.cpu_freq()
+        
+        # Get CPU frequency safely
+        try:
+            cpu_freq = psutil.cpu_freq()
+        except:
+            cpu_freq = None
+        
+        # Get per-CPU percentages safely
+        try:
+            per_cpu_percent = psutil.cpu_percent(percpu=True, interval=None)
+        except:
+            per_cpu_percent = []
         
         return {
-            'usage_percent': cpu_percent,
+            'usage_percent': round(max(0, min(100, cpu_percent)), 1),
             'count_logical': cpu_count,
             'count_physical': psutil.cpu_count(logical=False),
             'frequency': {
@@ -65,11 +78,27 @@ def get_cpu_info() -> Dict[str, Any]:
                 'min': cpu_freq.min if cpu_freq else None,
                 'max': cpu_freq.max if cpu_freq else None
             } if cpu_freq else None,
-            'per_cpu': psutil.cpu_percent(percpu=True)
+            'per_cpu': [round(cpu, 1) for cpu in per_cpu_percent],
+            'load_average': _get_load_average_safe(),
+            'timestamp': time.time()
         }
     except Exception as e:
         logger.error(f"Error getting CPU info: {e}")
-        return {'error': str(e)}
+        return {
+            'usage_percent': 0.0,
+            'count_logical': 1,
+            'count_physical': 1,
+            'error': str(e)
+        }
+
+def _get_load_average_safe():
+    """Safely get load average, return None if not available (Windows)"""
+    try:
+        if hasattr(psutil, 'getloadavg'):
+            return list(psutil.getloadavg())
+        return None
+    except:
+        return None
 
 
 def get_memory_info() -> Dict[str, Any]:
@@ -88,19 +117,26 @@ def get_memory_info() -> Dict[str, Any]:
                 'total': virtual_memory.total,
                 'available': virtual_memory.available,
                 'used': virtual_memory.used,
-                'percent': virtual_memory.percent,
-                'free': virtual_memory.free
+                'percent': round(virtual_memory.percent, 1),
+                'free': virtual_memory.free,
+                'cached': getattr(virtual_memory, 'cached', 0),
+                'buffers': getattr(virtual_memory, 'buffers', 0)
             },
             'swap': {
                 'total': swap_memory.total,
                 'used': swap_memory.used,
                 'free': swap_memory.free,
-                'percent': swap_memory.percent
-            }
+                'percent': round(swap_memory.percent, 1)
+            },
+            'timestamp': time.time()
         }
     except Exception as e:
         logger.error(f"Error getting memory info: {e}")
-        return {'error': str(e)}
+        return {
+            'virtual': {'total': 0, 'available': 0, 'used': 0, 'percent': 0.0, 'free': 0},
+            'swap': {'total': 0, 'used': 0, 'free': 0, 'percent': 0.0},
+            'error': str(e)
+        }
 
 
 def get_disk_info() -> Dict[str, Any]:
@@ -142,7 +178,26 @@ def get_network_info() -> Dict[str, Any]:
     """
     try:
         network_io = psutil.net_io_counters()
-        network_connections = len(psutil.net_connections())
+        
+        # Safely get network connections count (can hang on Windows)
+        try:
+            # Use timeout for connection counting
+            import signal
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Network connections query timed out")
+            
+            # Set timeout for Windows compatibility
+            if hasattr(signal, 'SIGALRM'):
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(2)  # 2 second timeout
+            
+            network_connections = len(psutil.net_connections())
+            
+            if hasattr(signal, 'SIGALRM'):
+                signal.alarm(0)  # Cancel timeout
+                
+        except (TimeoutError, Exception):
+            network_connections = -1  # Indicate unavailable
         
         return {
             'io': {
@@ -151,11 +206,15 @@ def get_network_info() -> Dict[str, Any]:
                 'packets_sent': network_io.packets_sent if network_io else None,
                 'packets_recv': network_io.packets_recv if network_io else None
             } if network_io else None,
-            'connections': network_connections
+            'connections': network_connections if network_connections >= 0 else None
         }
     except Exception as e:
         logger.error(f"Error getting network info: {e}")
-        return {'error': str(e)}
+        return {
+            'io': None,
+            'connections': None,
+            'error': str(e)
+        }
 
 
 def get_process_info() -> Dict[str, Any]:
@@ -168,23 +227,54 @@ def get_process_info() -> Dict[str, Any]:
     try:
         current_process = psutil.Process()
         
+        # Get CPU percent safely (non-blocking)
+        try:
+            cpu_percent = current_process.cpu_percent(interval=None)
+        except:
+            cpu_percent = 0.0
+        
+        # Get file and connection info safely
+        open_files_count = None
+        connections_count = None
+        
+        try:
+            if hasattr(current_process, 'open_files'):
+                open_files_count = len(current_process.open_files())
+        except:
+            pass
+            
+        try:
+            if hasattr(current_process, 'connections'):
+                connections_count = len(current_process.connections())
+        except:
+            pass
+        
         return {
             'pid': current_process.pid,
             'name': current_process.name(),
             'status': current_process.status(),
-            'cpu_percent': current_process.cpu_percent(),
+            'cpu_percent': round(cpu_percent, 1),
             'memory_info': {
                 'rss': current_process.memory_info().rss,
                 'vms': current_process.memory_info().vms
             },
-            'memory_percent': current_process.memory_percent(),
+            'memory_percent': round(current_process.memory_percent(), 1),
             'create_time': datetime.fromtimestamp(current_process.create_time()).isoformat(),
             'num_threads': current_process.num_threads(),
-            'open_files': len(current_process.open_files()) if hasattr(current_process, 'open_files') else None
+            'open_files': open_files_count,
+            'connections': connections_count
         }
     except Exception as e:
         logger.error(f"Error getting process info: {e}")
-        return {'error': str(e)}
+        return {
+            'pid': 0,
+            'name': 'unknown',
+            'status': 'unknown',
+            'cpu_percent': 0.0,
+            'memory_info': {'rss': 0, 'vms': 0},
+            'memory_percent': 0.0,
+            'error': str(e)
+        }
 
 
 def get_environment_variables() -> Dict[str, str]:
@@ -294,28 +384,68 @@ def run_health_check() -> Dict[str, Any]:
 
 def get_server_status() -> Dict[str, Any]:
     """
-    Get comprehensive server status information
+    Get comprehensive server status information with timeout protection
     
     Returns:
         Dictionary containing all server metrics and status
     """
     try:
-        return {
-            'timestamp': datetime.now().isoformat(),
-            'system': get_system_info(),
-            'cpu': get_cpu_info(),
-            'memory': get_memory_info(),
-            'disk': get_disk_info(),
-            'network': get_network_info(),
-            'process': get_process_info(),
-            'health': run_health_check(),
-            'environment': get_environment_variables(),
-            'packages_count': len(get_installed_packages())
-        }
+        # Use timeout to prevent hanging
+        import signal
+        import platform
         
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Server status collection timed out")
+        
+        result = {}
+        
+        # Only use signal timeout on Unix systems
+        use_signal_timeout = platform.system() != 'Windows' and hasattr(signal, 'SIGALRM')
+        
+        if use_signal_timeout:
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(6)  # 6 second timeout (increased from 4s)
+        
+        try:
+            result = {
+                'timestamp': datetime.now().isoformat(),
+                'system': get_system_info(),
+                'cpu': get_cpu_info(),
+                'memory': get_memory_info(),
+                'disk': get_disk_info(),
+                'network': get_network_info(),
+                'process': get_process_info(),
+                'health': run_health_check(),
+                'environment': get_environment_variables(),
+                'packages_count': _get_packages_count_safe()
+            }
+        finally:
+            if use_signal_timeout:
+                signal.alarm(0)  # Cancel timeout
+        
+        return result
+        
+    except TimeoutError:
+        logger.error("Server status collection timed out")
+        return {
+            'error': 'Status collection timed out',
+            'timestamp': datetime.now().isoformat(),
+            'status': 'timeout'
+        }
     except Exception as e:
         logger.error(f"Error getting server status: {e}")
         return {
             'error': str(e),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'status': 'error'
         }
+
+def _get_packages_count_safe() -> int:
+    """Safely get package count without loading all packages"""
+    try:
+        import pkg_resources
+        # Count packages without loading full details (faster)
+        return len(list(pkg_resources.working_set))
+    except Exception as e:
+        logger.error(f"Error counting packages: {e}")
+        return 0

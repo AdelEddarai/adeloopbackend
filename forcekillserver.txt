@@ -1,0 +1,11 @@
+If you know the port (for example, FastAPI is running on port 8000):
+
+netstat -ano | findstr :8000
+
+
+This shows the PID (process ID). Then run:
+
+taskkill /PID <PID> /F
+
+
+Replace <PID> with the number you got.

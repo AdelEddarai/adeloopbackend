@@ -27,6 +27,7 @@ from api.middleware import setup_all_middleware
 from api.routes.execution import router as execution_router
 from api.routes.monitoring import router as monitoring_router
 from api.routes.streamlit import router as streamlit_router, streamlit_router
+from api.routes.websocket import router as websocket_router
 
 # Setup logging
 logging.basicConfig(level=getattr(logging, LOG_LEVEL))
@@ -70,6 +71,7 @@ def create_app() -> FastAPI:
     app.include_router(execution_router)
     app.include_router(monitoring_router)
     app.include_router(streamlit_router)
+    app.include_router(websocket_router)  # Add WebSocket routes
 
     # Include non-API routers (for serving pages)
     app.include_router(streamlit_router)
@@ -88,21 +90,9 @@ async def startup_event():
     logger.info("🚀 HRatlas Backend starting up...")
     logger.info(f"📊 Application: {APP_TITLE} v{APP_VERSION}")
 
-    # Initialize services if needed
-    try:
-        # Test kernel initialization
-        from services.kernel.kernel_manager import get_kernel
-        kernel = get_kernel()
-        logger.info("✅ Jupyter kernel initialized successfully")
-
-        # Test monitoring services
-        from services.monitoring.server_monitoring import get_system_info
-        system_info = get_system_info()
-        logger.info(f"✅ Monitoring services initialized - System: {system_info.get('system', 'Unknown')}")
-
-    except Exception as e:
-        logger.error(f"❌ Error during startup: {str(e)}")
-
+    # DO NOT initialize heavy services on startup - causes blocking
+    # Services will be initialized on first use (lazy loading)
+    
     logger.info("🎉 HRatlas Backend startup complete!")
 
 
@@ -147,27 +137,28 @@ async def root():
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for frontend to verify backend availability"""
-    try:
-        # Test kernel availability
-        from services.kernel.kernel_manager import get_kernel
-        kernel = get_kernel()
-        
-        return {
-            "status": "healthy",
-            "service": "HRatlas Backend API",
-            "version": APP_VERSION,
-            "kernel_status": "available",
-            "timestamp": None  # Can add datetime.now() if needed
-        }
-    except Exception as e:
-        return {
-            "status": "degraded",
-            "service": "HRatlas Backend API", 
-            "version": APP_VERSION,
-            "kernel_status": "unavailable",
-            "error": str(e)
-        }
+    """Fast health check endpoint - NO BLOCKING OPERATIONS"""
+    return {
+        "status": "healthy",
+        "service": "HRatlas Backend API",
+        "version": APP_VERSION
+    }
+
+# Quick ping endpoint for connectivity test
+@app.get("/ping")
+async def ping():
+    """Ultra-fast ping endpoint"""
+    return {"status": "pong"}
+
+# WebSocket test endpoint
+@app.get("/ws-test")
+async def websocket_test():
+    """Test endpoint to verify WebSocket setup"""
+    return {
+        "websocket_available": True,
+        "endpoint": "/ws/execute/{client_id}",
+        "status": "ready"
+    }
 
 
 
@@ -176,4 +167,13 @@ if __name__ == "__main__":
     from config.settings import HOST, PORT
 
     logger.info(f"🚀 Starting HRatlas Backend server on {HOST}:{PORT}")
-    uvicorn.run(app, host=HOST, port=PORT)
+    
+    # Use uvicorn with better configuration for stability
+    uvicorn.run(
+        app, 
+        host=HOST, 
+        port=PORT,
+        log_level="warning",  # Reduce log noise
+        access_log=False,     # Disable access logs for performance
+        workers=1             # Single worker to avoid resource conflicts
+    )

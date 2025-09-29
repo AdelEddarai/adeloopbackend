@@ -47,6 +47,10 @@ class JupyterKernel:
         # Create temp directory for CSV files
         import tempfile
         self.temp_dir = tempfile.mkdtemp(prefix="jupyter_kernel_")
+        # Execution state for input handling
+        self._execution_state = None
+        self._pending_code = None
+        self._accumulated_output = ""
         self.setup_namespace()
     
     def setup_namespace(self):
@@ -341,18 +345,29 @@ class JupyterKernel:
         # Initialize input queue for handling user input
         self._user_input_queue = []
 
-        # Enhanced input function with better feedback
+        # Enhanced input function with better feedback and persistent state
         def custom_input(prompt=""):
+            # Store the prompt in accumulated output
+            if not hasattr(self, '_accumulated_output'):
+                self._accumulated_output = ""
+                
             # Print the prompt with proper formatting
             if prompt:
                 print(prompt, end="", flush=True)
+                # Add prompt to accumulated output (but don't duplicate if already there)
+                if not self._accumulated_output.endswith(prompt):
+                    self._accumulated_output += prompt
             else:
                 print("Enter input: ", end="", flush=True)
+                if not self._accumulated_output.endswith("Enter input: "):
+                    self._accumulated_output += "Enter input: "
 
             # Check if we have queued input
             if hasattr(self, '_user_input_queue') and self._user_input_queue:
                 user_input = self._user_input_queue.pop(0)
                 print(user_input)  # Echo the input like Jupyter
+                # Add the input to accumulated output
+                self._accumulated_output += user_input + "\n"
                 return user_input
 
             # If no queued input, signal that we need input with the prompt
@@ -565,34 +580,70 @@ class JupyterKernel:
         return plotly_plots
 
     def provide_input_and_continue(self, user_input: str, original_code: str):
-        """Provide user input and continue execution with enhanced feedback"""
-        # Store the user input in a way that the input() function can access it
-        self._user_input_queue = [user_input]
-
-        # Enhanced input function that provides better feedback
-        def input_with_provided_value(prompt=""):
-            if self._user_input_queue:
-                value = self._user_input_queue.pop(0)
-                # Format output like Jupyter: show prompt and input
-                if prompt:
-                    print(f"{prompt}{value}")
-                else:
-                    print(f"Enter input: {value}")
-                return value
-            # If no more input available, ask for more (with reduced timeout)
-            raise InputRequiredException(prompt or "Enter additional input: ")
-
-        # Temporarily replace input function
-        original_input = self.namespace['input']
-        self.namespace['input'] = input_with_provided_value
-
+        """Provide user input and continue execution like Jupyter - FIXED for multiple inputs"""
+        print(f"✅ Received input: '{user_input}'")
+        
+        # Initialize input queue if not exists
+        if not hasattr(self, '_user_input_queue'):
+            self._user_input_queue = []
+        
+        # Add the input to our queue
+        self._user_input_queue.append(user_input)
+        
+        # Store original code for continuation
+        self._pending_code = original_code
+        
+        print(f"🔄 Continuing execution with input: {user_input}")
+        
         try:
-            # Re-execute the code with the provided input
+            # Execute the code - input() calls will consume from the queue
             result = self.execute_code(original_code)
-            return result
-        finally:
-            # Restore original input function
-            self.namespace['input'] = original_input
+            
+            # Check if execution completed successfully (no input_required status)
+            if result.get('status') != 'input_required':
+                print(f"✅ Execution completed successfully")
+                # Clear the input queue after successful completion
+                self._user_input_queue = []
+                self._pending_code = None
+                return result
+            else:
+                # Still needs more input - return the input request
+                print(f"⏸️ Execution paused - needs more input: {result.get('input_prompt', 'Enter input')}")
+                return result
+                        
+        except InputRequiredException as input_ex:
+            # Code needs more input
+            print(f"⏸️ Execution paused - needs input: {input_ex.prompt}")
+            return {
+                'execution_count': self.execution_count,
+                'status': 'input_required',
+                'stdout': getattr(self, '_accumulated_output', ''),
+                'stderr': '',
+                'input_prompt': input_ex.prompt,
+                'needs_input': True,
+                'plots': [],
+                'html_outputs': [],
+                'error': None,
+                'variables': {},
+                'data': None
+            }
+        except Exception as e:
+            print(f"❌ Error during input continuation: {e}")
+            return {
+                'execution_count': self.execution_count,
+                'status': 'error',
+                'stdout': getattr(self, '_accumulated_output', ''),
+                'stderr': str(e),
+                'plots': [],
+                'html_outputs': [],
+                'error': {
+                    'ename': type(e).__name__,
+                    'evalue': str(e),
+                    'traceback': [str(e)]
+                },
+                'variables': {},
+                'data': None
+            }
 
     def display_media(self, data: Any) -> Optional[str]:
         """Handle display of various media types (images, videos, etc.)"""
@@ -839,7 +890,7 @@ class JupyterKernel:
         html_outputs = []
 
         try:
-            # Redirect stdout and stderr
+            # Redirect stdout and stderr with SIMPLE timeout protection
             with contextlib.redirect_stdout(stdout_capture), \
                  contextlib.redirect_stderr(stderr_capture):
 
@@ -848,7 +899,7 @@ class JupyterKernel:
                     raise RuntimeError("Namespace is corrupted - resetting")
 
                 # Execute the entire code block as-is (like Jupyter)
-                # This handles print statements, loops, functions, etc. naturally
+                # NOTE: Removed signal timeout as it blocks on Windows
                 exec(code, self.namespace)
 
                 # Try to get the result of the last expression if it exists
@@ -934,11 +985,16 @@ class JupyterKernel:
                 except Exception as recovery_error:
                     print(f"❌ Namespace recovery failed: {recovery_error}")
                     
+            # Format error information like Jupyter notebook
             error_info = {
                 'ename': type(e).__name__,
                 'evalue': str(e),
                 'traceback': traceback.format_exc().split('\n')
             }
+            
+            # Print error to stderr for better visibility
+            print(f"❌ Python Error: {type(e).__name__}: {str(e)}", file=sys.stderr)
+            print(f"   Traceback: {traceback.format_exc()}", file=sys.stderr)
         finally:
             # Restore working directory
             os.chdir(old_cwd)
@@ -970,6 +1026,14 @@ class JupyterKernel:
         # Get stdout and stderr
         stdout_text = stdout_capture.getvalue()
         stderr_text = stderr_capture.getvalue()
+        
+        # Combine with accumulated output if it exists (for progressive input display)
+        if hasattr(self, '_accumulated_output') and self._accumulated_output:
+            # Prepend accumulated output to show input progression
+            stdout_text = self._accumulated_output + stdout_text
+            # Clear accumulated output if execution completed successfully
+            if not error_info:
+                self._accumulated_output = ""
 
         # Enhanced DataFrame detection and handling
         table_result = None
@@ -1187,3 +1251,26 @@ def reset_kernel():
         _kernel_instance.reset_namespace()
     else:
         _kernel_instance = JupyterKernel()
+
+# Global kernel instance management
+_global_kernel = None
+
+def get_kernel():
+    """Get or create the global kernel instance"""
+    global _global_kernel
+    if _global_kernel is None:
+        _global_kernel = JupyterKernel()
+    return _global_kernel
+
+def reset_kernel():
+    """Reset the global kernel instance"""
+    global _global_kernel
+    if _global_kernel is not None:
+        _global_kernel.cleanup()
+    _global_kernel = JupyterKernel()
+    return _global_kernel
+
+def input_with_provided_value(prompt=""):
+    """Input function that can be overridden with provided values"""
+    kernel = get_kernel()
+    return kernel.namespace['input'](prompt)

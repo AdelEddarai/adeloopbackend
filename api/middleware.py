@@ -113,35 +113,26 @@ def setup_cors_middleware(app: FastAPI):
 
 def setup_logging_middleware(app: FastAPI):
     """
-    Setup request/response logging middleware
+    Setup LIGHTWEIGHT request/response logging middleware
     
     Args:
         app: FastAPI application instance
     """
     @app.middleware("http")
     async def log_requests(request: Request, call_next: Callable):
-        """Log incoming requests and responses"""
+        """Log incoming requests and responses - MINIMAL"""
         start_time = time.time()
-        
-        # Log request
-        logger.info(f"Request: {request.method} {request.url}")
         
         try:
             # Process request
             response = await call_next(request)
             
-            # Calculate processing time
-            process_time = time.time() - start_time
-            
-            # Log response
-            logger.info(
-                f"Response: {response.status_code} - "
-                f"Time: {process_time:.3f}s - "
-                f"Path: {request.url.path}"
-            )
-            
-            # Add processing time to response headers
-            response.headers["X-Process-Time"] = str(process_time)
+            # Only log errors and important endpoints
+            if response.status_code >= 400 or request.url.path in ["/health", "/ping"]:
+                process_time = time.time() - start_time
+                logger.info(
+                    f"{request.method} {request.url.path} - {response.status_code} - {process_time:.3f}s"
+                )
             
             return response
             
@@ -149,7 +140,7 @@ def setup_logging_middleware(app: FastAPI):
             # Log error
             process_time = time.time() - start_time
             logger.error(
-                f"Request failed: {request.method} {request.url} - "
+                f"Request failed: {request.method} {request.url.path} - "
                 f"Error: {str(e)} - Time: {process_time:.3f}s"
             )
             
@@ -158,9 +149,7 @@ def setup_logging_middleware(app: FastAPI):
                 status_code=500,
                 content={
                     "error": "Internal server error",
-                    "message": str(e),
-                    "path": str(request.url.path),
-                    "method": request.method
+                    "message": str(e)
                 }
             )
 
@@ -246,17 +235,19 @@ def setup_rate_limiting_middleware(app: FastAPI):
             if timestamp > cutoff_time
         ]
         
-        # Check rate limit (max 100 requests per minute per IP)
-        if len(request_counts.get(client_ip, [])) >= 100:
-            logger.warning(f"Rate limit exceeded for IP: {client_ip}")
-            return CustomJSONResponse(
-                status_code=429,
-                content={
-                    "error": "Rate limit exceeded",
-                    "message": "Too many requests. Please try again later.",
-                    "retry_after": 60
-                }
-            )
+        # Check rate limit (max 1000 requests per minute per IP - INCREASED)
+        # Exclude health check endpoints from rate limiting
+        if request.url.path not in ["/health", "/ping", "/", "/ws-test"]:
+            if len(request_counts.get(client_ip, [])) >= 1000:
+                logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+                return CustomJSONResponse(
+                    status_code=429,
+                    content={
+                        "error": "Rate limit exceeded",
+                        "message": "Too many requests. Please try again later.",
+                        "retry_after": 60
+                    }
+                )
         
         # Add current request timestamp
         if client_ip not in request_counts:

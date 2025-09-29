@@ -63,11 +63,11 @@ def execute_code_with_kernel(
     try:
         # Handle user input if provided
         if user_input is not None:
-            # Store user input for the next input() call
-            if not hasattr(kernel, '_user_input_queue'):
-                kernel._user_input_queue = []
-            kernel._user_input_queue.append(user_input)
             logger.debug(f"Received user input: {user_input}")
+            # Use the provide_input_and_continue method for better input handling
+            result = kernel.provide_input_and_continue(user_input, code)
+            logger.debug(f"Input continuation completed with status: {result.get('status', 'unknown')}")
+            return result
 
         # Prepare datasets if provided
         if datasets:
