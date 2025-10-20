@@ -18,6 +18,10 @@ CLERK_SECRET_KEY = os.getenv('CLERK_SECRET_KEY')
 HOST = os.getenv('HOST', '0.0.0.0')
 PORT = int(os.getenv('PORT', 8000))
 
+# Redis Configuration
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
+ENABLE_REDIS = os.getenv('ENABLE_REDIS', 'false').lower() == 'true'  # Disable Redis by default
+
 # Server Tracking
 SERVER_START_TIME = time.time()
 

@@ -19,6 +19,9 @@ import mimetypes
 import tempfile
 import os
 
+# Import shell command utilities
+from services.kernel.shell_commands import execute_shell_command
+
 # Optional imports with fallbacks
 try:
     import requests
@@ -44,8 +47,9 @@ class JupyterKernel:
     def __init__(self):
         self.namespace = {}
         self.execution_count = 0
+        self.execution_history = []  # Track execution history
+        self.variables_history = {}  # Track variable changes
         # Create temp directory for CSV files
-        import tempfile
         self.temp_dir = tempfile.mkdtemp(prefix="jupyter_kernel_")
         # Execution state for input handling
         self._execution_state = None
@@ -74,10 +78,15 @@ class JupyterKernel:
             'math': __import__('math'),
             'random': __import__('random'),
             'base64': base64,
+            # Jupyter magic commands
+            'get_ipython': self.get_ipython_mock,
             # Streamlit support
             'streamlit': None,  # Will be set by main.py when needed
             'st': None,  # Will be set by main.py when needed
         })
+
+        # Add magic command functions
+        self._add_magic_commands()
 
         # Add MediaPipe and OpenCV support
         try:
@@ -297,7 +306,8 @@ class JupyterKernel:
             'display': display,
             'display_image': display_image,
             'display_video': display_video,
-            'stream_image': stream_image
+            'stream_image': stream_image,
+            '_execute_shell_command': execute_shell_command
         })
 
         # Setup matplotlib for non-interactive backend
@@ -421,7 +431,7 @@ class JupyterKernel:
 
             def custom_plotly_show(fig_self, *args, **kwargs):
                 try:
-                    # Generate HTML output that can be displayed directly
+                    # Generate HTML output that can be displayed directly - Jupyter-style responsive
                     fig_html = fig_self.to_html(
                         include_plotlyjs='inline',
                         div_id=f"plotly-div-{len(kernel_instance._plotly_figures)}",
@@ -429,9 +439,44 @@ class JupyterKernel:
                             'displayModeBar': True,
                             'displaylogo': False,
                             'modeBarButtonsToRemove': ['pan2d', 'lasso2d', 'select2d'],
-                            'responsive': True
+                            'responsive': True,
+                            'autosizable': True,
+                            'fillFrame': False,
+                            'frameMargins': 0
                         }
                     )
+
+                    # Add custom CSS and JS to make it truly responsive like Jupyter
+                    responsive_html = f"""
+                    <style>
+                        .plotly-graph-div {{
+                            width: 100% !important;
+                            height: auto !important;
+                            overflow: visible !important;
+                        }}
+                        .js-plotly-plot {{
+                            width: 100% !important;
+                            height: auto !important;
+                            overflow: visible !important;
+                        }}
+                        .plot-container {{
+                            width: 100% !important;
+                            height: auto !important;
+                            overflow: visible !important;
+                        }}
+                    </style>
+                    {fig_html}
+                    <script>
+                        // Ensure plot is responsive after loading
+                        setTimeout(function() {{
+                            var plotDiv = document.getElementById('plotly-div-{len(kernel_instance._plotly_figures)}');
+                            if (plotDiv && window.Plotly) {{
+                                window.Plotly.Plots.resize(plotDiv);
+                            }}
+                        }}, 100);
+                    </script>
+                    """
+                    fig_html = responsive_html
                     kernel_instance._plotly_figures.append(fig_html)
 
                     # Debug info
@@ -646,7 +691,7 @@ class JupyterKernel:
             }
 
     def display_media(self, data: Any) -> Optional[str]:
-        """Handle display of various media types (images, videos, etc.)"""
+        """Handle display of various media types (images, videos, etc.) with enhanced rich output support"""
         try:
             # Handle PIL Images (if PIL is available)
             if Image and hasattr(data, 'save') and hasattr(data, 'format'):
@@ -676,6 +721,22 @@ class JupyterKernel:
                 encoded = base64.b64encode(buffer.getvalue()).decode()
                 return f"data:image/png;base64,{encoded}"
 
+            # Handle matplotlib figures
+            elif hasattr(data, 'savefig') and hasattr(data, '__module__') and 'matplotlib' in data.__module__:
+                buffer = BytesIO()
+                data.savefig(buffer, format='png', bbox_inches='tight', dpi=100)
+                buffer.seek(0)
+                encoded = base64.b64encode(buffer.getvalue()).decode()
+                return f"data:image/png;base64,{encoded}"
+
+            # Handle Plotly figures
+            elif hasattr(data, 'to_html') and hasattr(data, '__module__') and 'plotly' in data.__module__:
+                try:
+                    html = data.to_html(include_plotlyjs='cdn')
+                    return html
+                except:
+                    pass
+
             # Handle file paths
             elif isinstance(data, str):
                 if os.path.isfile(data):
@@ -684,6 +745,10 @@ class JupyterKernel:
                         with open(data, 'rb') as f:
                             encoded = base64.b64encode(f.read()).decode()
                             return f"data:{mime_type};base64,{encoded}"
+                    elif mime_type and mime_type.startswith('text/'):
+                        with open(data, 'r') as f:
+                            content = f.read()
+                            return f"<pre>{content}</pre>"
 
                 # Handle URLs (if requests is available)
                 elif requests and data.startswith(('http://', 'https://')):
@@ -694,8 +759,16 @@ class JupyterKernel:
                             if content_type.startswith(('image/', 'video/', 'audio/')):
                                 encoded = base64.b64encode(response.content).decode()
                                 return f"data:{content_type};base64,{encoded}"
+                            elif content_type.startswith('text/'):
+                                return f"<pre>{response.text}</pre>"
                     except:
                         pass
+
+            # Handle HTML content
+            elif isinstance(data, str) and data.startswith('<') and data.endswith('>'):
+                # Simple HTML detection
+                if '<html' in data.lower() or '<div' in data.lower() or '<p' in data.lower():
+                    return data
 
             return None
         except Exception as e:
@@ -707,21 +780,272 @@ class JupyterKernel:
         # This will be populated by display() function calls
         return getattr(self, '_display_outputs', [])
 
+    def get_ipython_mock(self):
+        """Mock IPython interface for magic commands"""
+        return self
+
+    def _add_magic_commands(self):
+        """Add Jupyter-like magic commands with enhanced functionality"""
+        def magic_ls(line=''):
+            """List directory contents with details"""
+            try:
+                import os
+                import stat
+                contents = os.listdir('.')
+                print(f"{'Name':<30} {'Type':<10} {'Size':<10}")
+                print("-" * 50)
+                for item in contents:
+                    try:
+                        stat_info = os.stat(item)
+                        size = stat_info.st_size
+                        if os.path.isdir(item):
+                            item_type = 'DIR'
+                            print(f"{item+'/':<30} {item_type:<10} {'<DIR>':<10}")
+                        else:
+                            item_type = 'FILE'
+                            print(f"{item:<30} {item_type:<10} {size:<10}")
+                    except:
+                        print(f"{item:<30} {'UNKNOWN':<10} {'?':<10}")
+                return contents
+            except Exception as e:
+                print(f"Error: {e}")
+                return []
+
+        def magic_pwd(line=''):
+            """Print working directory"""
+            import os
+            pwd = os.getcwd()
+            print(f"Current directory: {pwd}")
+            return pwd
+
+        def magic_history(line=''):
+            """Show execution history"""
+            if not self.execution_history:
+                print("No execution history.")
+                return []
+            
+            print("Execution History:")
+            print(f"{'#':<5} {'Code':<50}")
+            print("-" * 55)
+            for entry in self.execution_history:
+                code_preview = entry['code'][:45] + '...' if len(entry['code']) > 45 else entry['code']
+                print(f"[{entry['execution_count']:<3}] {code_preview}")
+            return self.execution_history
+
+        def magic_who(line=''):
+            """List variable names"""
+            # Define built-in modules and functions to exclude
+            exclude_list = ['pd', 'np', 'plt', 'json', 'sys', 'io', 'warnings', 
+                          'os', 'datetime', 're', 'math', 'random', 'base64',
+                          'get_ipython', 'display', 'display_image', 'display_video',
+                          'ls', 'pwd', 'history', 'who', 'whos', 'reset', 'matplotlib',
+                          'time', 'requests', 'Image', 'exec', '__builtins__',
+                          'ls', 'pwd', 'history', 'who', 'whos', 'reset', 'matplotlib',
+                          'time', 'install', 'load', 'cd', 'lsmagic']
+            
+            user_vars = [name for name in self.namespace.keys() 
+                        if not name.startswith('_') and 
+                        name not in exclude_list and
+                        not callable(self.namespace[name])]
+            
+            if user_vars:
+                print("Variable names:")
+                for i, var in enumerate(user_vars, 1):
+                    print(f"  {i}. {var}")
+            else:
+                print("No variables defined.")
+            return user_vars
+
+        def magic_whos(line=''):
+            """List variables with details"""
+            # Define built-in modules and functions to exclude
+            exclude_list = ['pd', 'np', 'plt', 'json', 'sys', 'io', 'warnings',
+                          'os', 'datetime', 're', 'math', 'random', 'base64',
+                          'get_ipython', 'display', 'display_image', 'display_video',
+                          'ls', 'pwd', 'history', 'who', 'whos', 'reset', 'matplotlib',
+                          'time', 'requests', 'Image', 'exec', '__builtins__',
+                          'ls', 'pwd', 'history', 'who', 'whos', 'reset', 'matplotlib',
+                          'time', 'install', 'load', 'cd', 'lsmagic']
+            
+            user_vars = [name for name in self.namespace.keys() 
+                        if not name.startswith('_') and 
+                        name not in exclude_list and
+                        not callable(self.namespace[name])]
+            
+            if user_vars:
+                print(f"{'Variable':<20} {'Type':<15} {'Size/Value':<20}")
+                print("-" * 55)
+                for var in user_vars:
+                    value = self.namespace[var]
+                    var_type = type(value).__name__
+                    try:
+                        if hasattr(value, '__len__') and not isinstance(value, str):
+                            size = len(value)
+                            size_str = f"{size} items"
+                        else:
+                            size_str = str(value)[:20]
+                    except:
+                        size_str = "<unknown>"
+                    print(f"{var:<20} {var_type:<15} {size_str:<20}")
+            else:
+                print("No variables defined.")
+            return user_vars
+
+        def magic_reset(line=''):
+            """Reset namespace"""
+            # Keep important modules
+            keep_vars = ['pd', 'np', 'plt', 'json', 'sys', 'io', 'warnings',
+                        'os', 'datetime', 're', 'math', 'random', 'base64',
+                        'get_ipython', 'display', 'display_image', 'display_video',
+                        'ls', 'pwd', 'history', 'who', 'whos', 'reset', 'matplotlib',
+                        'time', 'requests', 'Image']
+            
+            # Store values to keep
+            keep_values = {name: self.namespace[name] for name in keep_vars if name in self.namespace}
+            
+            # Clear namespace
+            self.namespace.clear()
+            
+            # Restore keep values
+            self.namespace.update(keep_values)
+            
+            # Reset execution count
+            self.execution_count = 0
+            self.execution_history = []
+            
+            print("Namespace reset.")
+
+        def magic_time(line=''):
+            """Time execution of a statement"""
+            if not line:
+                print("Usage: %time statement")
+                return
+            
+            import time as time_module
+            start_time = time_module.perf_counter()
+            try:
+                __builtins__['exec'](line, self.namespace)
+                end_time = time_module.perf_counter()
+                execution_time = (end_time - start_time) * 1000  # Convert to milliseconds
+                print(f"CPU times: total: {execution_time:.2f} ms")
+            except Exception as e:
+                end_time = time_module.perf_counter()
+                execution_time = (end_time - start_time) * 1000
+                print(f"CPU times: total: {execution_time:.2f} ms")
+                print(f"Error: {e}")
+
+        def magic_matplotlib(line=''):
+            """Set matplotlib backend"""
+            try:
+                import matplotlib
+                if line:
+                    matplotlib.use(line)
+                    print(f"Matplotlib backend set to: {line}")
+                else:
+                    current_backend = matplotlib.get_backend()
+                    print(f"Current matplotlib backend: {current_backend}")
+            except Exception as e:
+                print(f"Error setting matplotlib backend: {e}")
+
+        def magic_install(line=''):
+            """Install Python packages using pip"""
+            if not line:
+                print("Usage: %install package_name")
+                return
+            
+            try:
+                from services.kernel.shell_commands import execute_pip_command
+                result = execute_pip_command(f"install {line}")
+                if result == 0:
+                    print(f"Successfully installed {line}")
+                else:
+                    print(f"Failed to install {line}")
+            except Exception as e:
+                print(f"Error installing package: {e}")
+
+        def magic_load(line=''):
+            """Load Python extensions or modules"""
+            if not line:
+                print("Usage: %load module_name")
+                return
+            
+            try:
+                # Try to import the module
+                module = __import__(line)
+                self.namespace[line] = module
+                print(f"Loaded module: {line}")
+            except ImportError:
+                print(f"Module not found: {line}")
+            except Exception as e:
+                print(f"Error loading module: {e}")
+
+        def magic_cd(line=''):
+            """Change directory"""
+            if not line:
+                print("Usage: %cd directory_path")
+                return
+            
+            try:
+                import os
+                os.chdir(line)
+                print(f"Changed directory to: {os.getcwd()}")
+            except Exception as e:
+                print(f"Error changing directory: {e}")
+
+        def magic_ls_magic(line=''):
+            """List magic commands"""
+            magic_commands = ['who', 'whos', 'history', 'ls', 'pwd', 'time', 'matplotlib', 'install', 'load', 'cd', 'reset']
+            print("Available magic commands:")
+            for cmd in sorted(magic_commands):
+                print(f"  %{cmd}")
+
+        # Add magic commands to namespace
+        self.namespace.update({
+            'ls': magic_ls,
+            'pwd': magic_pwd,
+            'history': magic_history,
+            'who': magic_who,
+            'whos': magic_whos,
+            'reset': magic_reset,
+            'time': magic_time,
+            'matplotlib': magic_matplotlib,
+            'install': magic_install,
+            'load': magic_load,
+            'cd': magic_cd,
+            'lsmagic': magic_ls_magic
+        })
+
+    def run_line_magic(self, magic_name, line=''):
+        """Run a line magic command"""
+        # Make sure exec is available as a built-in
+        if 'exec' not in self.namespace and 'exec' in __builtins__:
+            self.namespace['exec'] = __builtins__['exec']
+        
+        if magic_name in self.namespace:
+            try:
+                return self.namespace[magic_name](line)
+            except Exception as e:
+                print(f"Error in magic command {magic_name}: {e}")
+                return None
+        else:
+            print(f"Unknown magic command: {magic_name}")
+            return None
+
     def format_dataframe_html(self, df: pd.DataFrame, max_rows: int = 100) -> str:
-        """Format DataFrame as HTML table"""
+        """Format DataFrame as HTML table with enhanced styling"""
         if len(df) > max_rows:
             # Show first and last rows with truncation indicator
             top_rows = df.head(max_rows // 2)
             bottom_rows = df.tail(max_rows // 2)
 
             html_parts = []
-            html_parts.append(top_rows.to_html(classes='dataframe', table_id='dataframe'))
-            html_parts.append(f'<div class="truncation-indicator">... {len(df) - max_rows} more rows ...</div>')
-            html_parts.append(bottom_rows.to_html(classes='dataframe', table_id='dataframe'))
+            html_parts.append(top_rows.to_html(classes='dataframe table table-striped', table_id='dataframe', escape=False))
+            html_parts.append(f'<div class="truncation-indicator alert alert-info">... {len(df) - max_rows} more rows ...</div>')
+            html_parts.append(bottom_rows.to_html(classes='dataframe table table-striped', table_id='dataframe', escape=False))
 
             return ''.join(html_parts)
         else:
-            return df.to_html(classes='dataframe', table_id='dataframe')
+            return df.to_html(classes='dataframe table table-striped', table_id='dataframe', escape=False)
 
     def _clean_dataframe_for_json(self, df):
         """
@@ -734,6 +1058,14 @@ class JupyterKernel:
             
             # Make a copy to avoid modifying original data
             cleaned_df = df.copy()
+            
+            # Convert range objects in object columns to lists
+            for col in cleaned_df.columns:
+                if cleaned_df[col].dtype == 'object':
+                    # Check if any values in this column are range objects
+                    if cleaned_df[col].apply(lambda x: isinstance(x, range)).any():
+                        # Convert range objects to lists
+                        cleaned_df[col] = cleaned_df[col].apply(lambda x: list(x) if isinstance(x, range) else x)
             
             # Replace infinite values with NaN first
             cleaned_df = cleaned_df.replace([np.inf, -np.inf], np.nan)
@@ -790,6 +1122,17 @@ class JupyterKernel:
         for line in lines:
             line_stripped = line.strip()
 
+            # Handle magic commands
+            if line_stripped.startswith('%'):
+                # Extract magic command
+                magic_parts = line_stripped[1:].split(' ', 1)
+                magic_name = magic_parts[0]
+                magic_args = magic_parts[1] if len(magic_parts) > 1 else ''
+                
+                # Replace with function call
+                processed_lines.append(f"get_ipython().run_line_magic('{magic_name}', '{magic_args}')")
+                continue
+
             # Skip or modify Streamlit commands
             if (line_stripped.startswith('st.') or
                 'streamlit' in line_stripped.lower() or
@@ -804,6 +1147,20 @@ class JupyterKernel:
             # Handle _repr_html_ calls that might cause issues
             if '_repr_html_()' in line_stripped:
                 processed_lines.append(f"# {line}  # _repr_html_ call - handled separately")
+                continue
+
+            # Handle shell commands with output capture
+            if line_stripped.startswith('!'):
+                # Extract shell command
+                shell_cmd = line_stripped[1:]
+                # Use subprocess for better output capture
+                processed_lines.append(f"_execute_shell_command('{shell_cmd}')")
+                continue
+
+            # Handle IPython-style shell commands (%%bash, %%sh, etc.)
+            if line_stripped.startswith('%%'):
+                # For now, comment out cell magic commands
+                processed_lines.append(f"# {line}  # Cell magic command - not supported in this context")
                 continue
 
             processed_lines.append(line)
@@ -829,6 +1186,13 @@ class JupyterKernel:
         """
 
         self.execution_count += 1
+        
+        # Add to execution history
+        self.execution_history.append({
+            'execution_count': self.execution_count,
+            'code': code,
+            'timestamp': str(pd.Timestamp.now())
+        })
 
         # Store current working directory
         old_cwd = os.getcwd()
@@ -900,7 +1264,7 @@ class JupyterKernel:
 
                 # Execute the entire code block as-is (like Jupyter)
                 # NOTE: Removed signal timeout as it blocks on Windows
-                exec(code, self.namespace)
+                exec(processed_code, self.namespace)
 
                 # Try to get the result of the last expression if it exists
                 code_lines = [line.strip() for line in code.strip().split('\n') if line.strip()]
@@ -914,22 +1278,45 @@ class JupyterKernel:
                         # If successful, evaluate it to get the result
                         result = eval(last_line, self.namespace)
 
-                        # Handle special result types
+                        # Handle special result types with enhanced rich output
                         if isinstance(result, pd.DataFrame):
                             html_outputs.append(self.format_dataframe_html(result))
                         elif hasattr(result, '_repr_html_'):
                             try:
-                                html_outputs.append(result._repr_html_())
+                                html_repr = result._repr_html_()
+                                if html_repr:
+                                    html_outputs.append(html_repr)
                             except Exception as e:
                                 # Handle Streamlit objects that don't work in this context
                                 if 'streamlit' in str(type(result)).lower() or '_repr_html_' in str(e):
                                     # Skip Streamlit objects - they need to run in Streamlit context
                                     pass
                                 else:
-                                    html_outputs.append(f"<div>Error rendering HTML: {str(e)}</div>")
-                        # Don't show None results
-                        elif result is None:
-                            result = None
+                                    html_outputs.append(f"<div class='alert alert-warning'>Error rendering HTML: {str(e)}</div>")
+                        elif hasattr(result, 'to_html'):
+                            # Handle objects with to_html method (like Plotly figures)
+                            try:
+                                html_outputs.append(result.to_html())
+                            except:
+                                pass
+                        # Handle matplotlib figures
+                        elif hasattr(result, 'savefig') and hasattr(result, '__module__') and 'matplotlib' in result.__module__:
+                            media_output = self.display_media(result)
+                            if media_output:
+                                html_outputs.append(f'<img src="{media_output}" alt="Matplotlib Figure" class="img-fluid" />')
+                        # Handle other rich outputs
+                        elif result is not None:
+                            # Try to convert to string representation
+                            try:
+                                str_result = str(result)
+                                if str_result and not str_result.startswith('<'):
+                                    # Simple string output
+                                    pass
+                                elif str_result.startswith('<'):
+                                    # HTML-like output
+                                    html_outputs.append(str_result)
+                            except:
+                                pass
 
                     except (SyntaxError, TypeError):
                         # Last line is a statement, not an expression
@@ -995,6 +1382,13 @@ class JupyterKernel:
             # Print error to stderr for better visibility
             print(f"❌ Python Error: {type(e).__name__}: {str(e)}", file=sys.stderr)
             print(f"   Traceback: {traceback.format_exc()}", file=sys.stderr)
+            
+            # Flush any remaining output even in case of error
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except:
+                pass
         finally:
             # Restore working directory
             os.chdir(old_cwd)
@@ -1063,214 +1457,129 @@ class JupyterKernel:
                         hasattr(value, '__class__') and
                         isinstance(value, pd.DataFrame) and
                         not name.startswith('_') and
-                        name not in ['pd', 'np', 'plt'] and
-                        len(value) > 0):
+                        name not in ['pd', 'np', 'plt', 'json', 'sys', 'io', 'warnings']):
                         # Clean the DataFrame before converting to dict
-                        cleaned_value = self._clean_dataframe_for_json(value)
+                        cleaned_df = self._clean_dataframe_for_json(value)
                         dataframe_variables.append({
                             'name': name,
-                            'data': cleaned_value.to_dict('records'),
-                            'shape': value.shape
+                            'data': cleaned_df.to_dict('records'),
+                            'columns': [{'key': col, 'label': col} for col in cleaned_df.columns],
+                            'shape': cleaned_df.shape
                         })
-                except (TypeError, AttributeError, ValueError, KeyError) as e:
-                    # Skip problematic variables silently
-                    print(f"⚠️ Skipping variable '{name}' due to error: {e}")
+                except Exception as var_error:
+                    print(f"⚠️ Error processing variable {name}: {var_error}")
                     continue
-        except (TypeError, AttributeError) as e:
-            print(f"⚠️ Error iterating namespace for DataFrames: {e}")
-            dataframe_variables = []
+        except Exception as e:
+            print(f"⚠️ Error checking namespace variables: {e}")
 
-        # If we have DataFrame variables but no direct result, use the most recent one
-        if not dataframe_data and dataframe_variables:
-            # Use the last DataFrame variable (most recently assigned)
-            latest_df = dataframe_variables[-1]
-            dataframe_data = latest_df['data']
-            if not table_result:
-                table_result = {
-                    'type': 'table',
-                    'data': latest_df['data'],
-                    'columns': [{'key': col, 'label': col} for col in latest_df['data'][0].keys()] if latest_df['data'] else [],
-                    'title': f'DataFrame: {latest_df["name"]}'
-                }
-
-        # Combine stdout with any expression results for complete output
-        combined_output = stdout_text
-        if result is not None and not plotly_result and not table_result:
-            # Add the result to the output if it's not already printed
-            result_str = ""
-            if isinstance(result, (str, int, float, bool)):
-                result_str = str(result)
-            elif isinstance(result, (list, dict, tuple)):
-                result_str = repr(result)
-            elif isinstance(result, pd.DataFrame):
-                result_str = f"DataFrame with {result.shape[0]} rows and {result.shape[1]} columns"
-            else:
-                result_str = str(result)
-
-            # Only add if it's not already in stdout
-            if result_str and result_str not in stdout_text:
-                combined_output += f"\n{result_str}" if combined_output else result_str
-
-        # Extract user-defined variables (exclude built-ins and modules)
+        # Track variable changes for history
         user_variables = {}
-        try:
-            # Safely iterate over namespace items with proper error handling
-            namespace_items = list(self.namespace.items()) if hasattr(self.namespace, 'items') else []
-            for name, value in namespace_items:
+        for name, value in self.namespace.items():
+            if (not name.startswith('_') and 
+                not callable(value) and 
+                not hasattr(value, '__module__') and
+                name not in ['pd', 'np', 'plt', 'json', 'sys', 'io', 'warnings', 'os', 'datetime', 're', 'math', 'random', 'base64',
+                           'get_ipython', 'display', 'display_image', 'display_video', 'ls', 'pwd', 'history', 'who', 'whos', 'reset']):
                 try:
-                    # Additional safety checks
-                    if (name and isinstance(name, str) and 
-                        not name.startswith('_') and
-                        value is not None and
-                        hasattr(value, '__class__') and
-                        not callable(value) and
-                        not hasattr(value, '__module__') and
-                        name not in ['pd', 'np', 'plt', 'json', 'sys', 'io', 'warnings', 'os', 'datetime', 're', 'math', 'random']):
-                        
-                        # Only include serializable variables with extra safety
-                        if isinstance(value, (int, float, str, bool, list, dict)):
-                            user_variables[name] = value
-                        elif hasattr(value, 'shape') and isinstance(value, pd.DataFrame):
-                            user_variables[name] = f"DataFrame({value.shape[0]} rows, {value.shape[1]} cols)"
-                        elif hasattr(value, 'shape') and isinstance(value, np.ndarray):
-                            user_variables[name] = f"Array{value.shape}"
-                        else:
-                            # Safe string conversion without using vars()
-                            try:
-                                type_name = type(value).__name__ if hasattr(value, '__class__') else 'Unknown'
-                                user_variables[name] = type_name
-                            except:
-                                user_variables[name] = "Object"
-                except (TypeError, AttributeError, ValueError, KeyError) as e:
-                    # Skip problematic variables silently
-                    try:
-                        user_variables[name] = "Object"
-                    except:
-                        continue
-        except (TypeError, AttributeError) as e:
-            print(f"⚠️ Error extracting user variables: {e}")
-            user_variables = {}
+                    # Only include serializable variables
+                    if isinstance(value, (int, float, str, bool, list, dict)):
+                        user_variables[name] = value
+                    elif isinstance(value, pd.DataFrame):
+                        user_variables[name] = f"DataFrame({value.shape[0]} rows, {value.shape[1]} cols)"
+                    elif isinstance(value, np.ndarray):
+                        user_variables[name] = f"Array{value.shape}"
+                    else:
+                        user_variables[name] = str(type(value).__name__)
+                except:
+                    user_variables[name] = "Object"
+        
+        # Store variables in history
+        self.variables_history[self.execution_count] = user_variables
 
+        # Return comprehensive execution results
         return {
             'execution_count': self.execution_count,
             'status': 'error' if error_info else 'ok',
-            'stdout': combined_output,  # Use combined output for better display
+            'stdout': stdout_text,
             'stderr': stderr_text,
-            'result': table_result if table_result else (plotly_result if plotly_result else result),
-            'plots': matplotlib_plots,  # Matplotlib plots only
-            'plotly_figures': plotly_figures,  # Plotly figures separately
+            'result': result,
+            'plots': matplotlib_plots,
+            'plotly_figures': plotly_figures,
+            'plotly_result': plotly_result,
             'html_outputs': html_outputs,
+            'table_result': table_result,
+            'dataframe_data': dataframe_data,
+            'dataframe_variables': dataframe_variables,
+            'display_outputs': display_outputs,
             'error': error_info,
-            'variables': user_variables,
-            'data': dataframe_data if dataframe_data else (self._clean_dataframe_for_json(result).to_dict('records') if isinstance(result, pd.DataFrame) else None),
-            'media_count': len(matplotlib_plots) + len(plotly_figures) + len(display_outputs),
+            'variables': user_variables,  # Include current variables
+            'execution_history': self.execution_history,  # Include execution history
+            'variable_history': self.variables_history,  # Include variable history
+            'data': None,
+            'media_count': len(display_outputs),
             'plot_count': len(matplotlib_plots),
             'display_count': len(display_outputs),
-            'plotly_count': len(plotly_figures),
-            'dataframe_variables': dataframe_variables  # Include info about DataFrame variables
+            'plotly_count': len(plotly_figures)
         }
 
-    def get_namespace_info(self) -> Dict[str, Any]:
-        """Get information about current namespace variables"""
-        variables = {}
-        try:
-            # Safely iterate over namespace items
-            namespace_items = list(self.namespace.items()) if hasattr(self.namespace, 'items') else []
-            for name, value in namespace_items:
-                try:
-                    if (name and isinstance(name, str) and 
-                        not name.startswith('_') and 
-                        value is not None and
-                        not callable(value)):
-                        
-                        # Safe value string conversion
-                        try:
-                            value_str = str(value) if len(str(value)) < 100 else f"{str(value)[:100]}..."
-                        except:
-                            value_str = "<unprintable>"
-                            
-                        # Safe type name extraction
-                        try:
-                            type_name = type(value).__name__ if hasattr(value, '__class__') else 'Unknown'
-                        except:
-                            type_name = 'Unknown'
-                            
-                        # Safe shape extraction
-                        try:
-                            shape = getattr(value, 'shape', None)
-                        except:
-                            shape = None
-                            
-                        variables[name] = {
-                            'type': type_name,
-                            'value': value_str,
-                            'shape': shape
-                        }
-                except (TypeError, AttributeError, ValueError) as e:
-                    # Skip problematic variables
-                    continue
-        except (TypeError, AttributeError) as e:
-            print(f"⚠️ Error getting namespace info: {e}")
-            
-        return variables
-
-    def reset_namespace(self):
-        """Reset the execution namespace"""
-        self.namespace.clear()
-        self.execution_count = 0
-        self.setup_namespace()
-
     def cleanup(self):
-        """Clean up temporary files"""
+        """Clean up kernel resources"""
         try:
-            import shutil
-            if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
-                shutil.rmtree(self.temp_dir)
+            # Clean up temp directory
+            if hasattr(self, 'temp_dir') and self.temp_dir:
+                import shutil
+                try:
+                    shutil.rmtree(self.temp_dir)
+                    print(f"🧹 Cleaned up temp directory: {self.temp_dir}")
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not clean up temp directory {self.temp_dir}: {e}")
+            
+            # Close any open matplotlib figures
+            try:
+                plt.close('all')
+            except:
+                pass
+                
+            # Clear namespace
+            self.namespace.clear()
+            
+            print("🧹 Kernel resources cleaned up")
         except Exception as e:
-            print(f"Warning: Could not clean up temp directory: {e}")
-
-    def __del__(self):
-        """Cleanup when kernel is destroyed"""
-        self.cleanup()
+            print(f"❌ Error during kernel cleanup: {e}")
 
 
-# Global kernel instance
+# Global kernel instance management
 _kernel_instance = None
 
-def get_kernel() -> JupyterKernel:
-    """Get or create the global kernel instance"""
+
+def get_kernel():
+    """
+    Get or create the global kernel instance
+    
+    Returns:
+        JupyterKernel: The active kernel instance
+    """
     global _kernel_instance
     if _kernel_instance is None:
         _kernel_instance = JupyterKernel()
+        print("🔧 Created new Jupyter kernel instance")
     return _kernel_instance
 
+
 def reset_kernel():
-    """Reset the global kernel instance"""
+    """
+    Reset the kernel by creating a new instance
+    
+    Returns:
+        JupyterKernel: New kernel instance
+    """
     global _kernel_instance
     if _kernel_instance:
-        _kernel_instance.reset_namespace()
-    else:
-        _kernel_instance = JupyterKernel()
-
-# Global kernel instance management
-_global_kernel = None
-
-def get_kernel():
-    """Get or create the global kernel instance"""
-    global _global_kernel
-    if _global_kernel is None:
-        _global_kernel = JupyterKernel()
-    return _global_kernel
-
-def reset_kernel():
-    """Reset the global kernel instance"""
-    global _global_kernel
-    if _global_kernel is not None:
-        _global_kernel.cleanup()
-    _global_kernel = JupyterKernel()
-    return _global_kernel
-
-def input_with_provided_value(prompt=""):
-    """Input function that can be overridden with provided values"""
-    kernel = get_kernel()
-    return kernel.namespace['input'](prompt)
+        try:
+            _kernel_instance.cleanup()
+        except Exception as e:
+            print(f"⚠️ Warning during kernel cleanup: {e}")
+    
+    _kernel_instance = JupyterKernel()
+    print("🔄 Reset Jupyter kernel instance")
+    return _kernel_instance

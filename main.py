@@ -12,13 +12,18 @@ The server uses modular components for better maintainability.
 """
 
 import logging
+import time
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from utils.responses import CustomJSONEncoder
 import json
+import asyncio
+
+# Import Redis manager
+from services.kernel.redis_manager import redis_manager
 
 # Import configuration
-from config.settings import APP_TITLE, APP_VERSION, APP_DESCRIPTION, LOG_LEVEL
+from config.settings import APP_TITLE, APP_VERSION, APP_DESCRIPTION, LOG_LEVEL, ENABLE_REDIS, SERVER_START_TIME
 
 # Import middleware setup
 from api.middleware import setup_all_middleware
@@ -27,7 +32,7 @@ from api.middleware import setup_all_middleware
 from api.routes.execution import router as execution_router
 from api.routes.monitoring import router as monitoring_router
 from api.routes.streamlit import router as streamlit_router, streamlit_router
-from api.routes.websocket import router as websocket_router
+from api.routes.websocket import router as websocket_router, init_zmq_sockets, close_zmq_sockets, forward_streaming_output
 
 # Setup logging
 logging.basicConfig(level=getattr(logging, LOG_LEVEL))
@@ -89,9 +94,30 @@ async def startup_event():
     """Application startup event handler"""
     logger.info("🚀 HRatlas Backend starting up...")
     logger.info(f"📊 Application: {APP_TITLE} v{APP_VERSION}")
+    logger.info(f"📊 Redis enabled: {ENABLE_REDIS}")
 
     # DO NOT initialize heavy services on startup - causes blocking
     # Services will be initialized on first use (lazy loading)
+    
+    # Initialize Redis manager (will fallback to in-memory if Redis not available)
+    try:
+        await redis_manager.connect()
+        if redis_manager.use_redis and ENABLE_REDIS:
+            logger.info("✅ Redis manager initialized")
+        else:
+            logger.info("⚠️ Redis disabled or not available, using in-memory storage")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Redis: {e}")
+    
+    # Initialize ZeroMQ sockets for kernel workers (if available)
+    try:
+        init_zmq_sockets()
+        # Start background task for streaming output forwarding
+        asyncio.create_task(forward_streaming_output())
+        logger.info("✅ ZeroMQ integration initialized")
+    except Exception as e:
+        logger.warning(f"⚠️ ZeroMQ not available: {e}")
+        # Continue without ZeroMQ - fallback to direct execution
     
     logger.info("🎉 HRatlas Backend startup complete!")
 
@@ -115,6 +141,17 @@ async def shutdown_event():
             from services.streamlit.streamlit_manager import cleanup_streamlit_app
             cleanup_streamlit_app(app_id)
         logger.info("✅ Streamlit apps cleaned up")
+
+        # Close Redis connection
+        try:
+            await redis_manager.disconnect()
+            logger.info("✅ Redis connection closed")
+        except Exception as e:
+            logger.error(f"❌ Error closing Redis: {e}")
+        
+        # Close ZeroMQ sockets
+        close_zmq_sockets()
+        logger.info("✅ ZeroMQ sockets closed")
 
     except Exception as e:
         logger.error(f"❌ Error during shutdown: {str(e)}")
@@ -148,7 +185,19 @@ async def health_check():
 @app.get("/ping")
 async def ping():
     """Ultra-fast ping endpoint"""
-    return {"status": "pong"}
+    return {"status": "pong", "timestamp": time.time()}
+
+# Backend status endpoint for frontend monitoring
+@app.get("/backend-status")
+async def backend_status():
+    """Quick backend status check for frontend monitoring"""
+    return {
+        "status": "online",
+        "service": "HRatlas Backend API",
+        "version": APP_VERSION,
+        "uptime": time.time() - SERVER_START_TIME,
+        "timestamp": time.time()
+    }
 
 # WebSocket test endpoint
 @app.get("/ws-test")

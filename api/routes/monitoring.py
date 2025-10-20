@@ -6,13 +6,16 @@ This module contains all API endpoints related to server monitoring:
 - System resource monitoring
 - Package information
 - Performance metrics
+- WebSocket monitoring for real-time updates
 """
 
 import logging
 import time
+import json
+import asyncio
 from typing import Dict, Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from services.monitoring.server_monitoring import (
@@ -34,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 # Create router for monitoring endpoints
 router = APIRouter(tags=["monitoring"])
+
+# Active monitoring WebSocket connections
+active_monitoring_connections: Dict[str, WebSocket] = {}
 
 
 @router.get("/health")
@@ -256,7 +262,7 @@ def _format_uptime(seconds: float) -> str:
     hours = int((seconds % 86400) // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
-    
+
     if days > 0:
         return f"{days}d {hours}h {minutes}m {secs}s"
     elif hours > 0:
@@ -265,3 +271,130 @@ def _format_uptime(seconds: float) -> str:
         return f"{minutes}m {secs}s"
     else:
         return f"{secs}s"
+
+
+@router.websocket("/ws/monitoring/{client_id}")
+async def monitoring_websocket(websocket: WebSocket, client_id: str):
+    """
+    WebSocket endpoint for real-time server monitoring
+
+    Best practices implementation:
+    - Push-based updates (no polling)
+    - Heartbeat/ping-pong mechanism
+    - Automatic cleanup on disconnect
+    - Error handling and recovery
+    """
+    await websocket.accept()
+    active_monitoring_connections[client_id] = websocket
+    logger.info(f"[MonitoringWS] Client {client_id} connected. Active connections: {len(active_monitoring_connections)}")
+
+    try:
+        # Send connection confirmation
+        await websocket.send_json({
+            "type": "connected",
+            "message": "Connected to monitoring WebSocket",
+            "client_id": client_id
+        })
+
+        # Main message loop
+        while True:
+            try:
+                # Wait for client messages with timeout
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
+                message = json.loads(data)
+
+                message_type = message.get("type", "")
+
+                if message_type == "ping":
+                    # Respond to heartbeat
+                    await websocket.send_json({
+                        "type": "pong",
+                        "timestamp": time.time()
+                    })
+
+                elif message_type == "request_monitoring_data":
+                    # Send current server status
+                    try:
+                        logger.info(f"[MonitoringWS] Collecting server status for client {client_id}")
+                        status_data = get_server_status()
+
+                        # Transform data to match frontend expectations
+                        monitoring_data = {
+                            "status": "running",
+                            "python_version": status_data.get("system", {}).get("python_version", "Unknown"),
+                            "server_uptime": time.time() - SERVER_START_TIME,
+                            "cpu_usage": status_data.get("cpu", {}).get("usage_percent", 0),
+                            "memory": {
+                                "total": status_data.get("memory", {}).get("virtual", {}).get("total", 0),
+                                "available": status_data.get("memory", {}).get("virtual", {}).get("available", 0),
+                                "percent": status_data.get("memory", {}).get("virtual", {}).get("percent", 0),
+                                "used": status_data.get("memory", {}).get("virtual", {}).get("used", 0)
+                            },
+                            "disk": {
+                                "total": status_data.get("disk", {}).get("usage", {}).get("total", 0),
+                                "free": status_data.get("disk", {}).get("usage", {}).get("free", 0),
+                                "used": status_data.get("disk", {}).get("usage", {}).get("used", 0),
+                                "percent": status_data.get("disk", {}).get("usage", {}).get("percent", 0)
+                            },
+                            "process": {
+                                "pid": status_data.get("process", {}).get("pid", 0),
+                                "memory_info": status_data.get("process", {}).get("memory_info", {}),
+                                "cpu_percent": status_data.get("process", {}).get("cpu_percent", 0),
+                                "create_time": status_data.get("process", {}).get("create_time", time.time())
+                            },
+                            "kernel": {
+                                "execution_count": 0,
+                                "namespace_variables": 0
+                            }
+                        }
+
+                        await websocket.send_json({
+                            "type": "monitoring",
+                            "data": monitoring_data,
+                            "timestamp": time.time()
+                        })
+
+                        logger.info(f"[MonitoringWS] Sent monitoring data to client {client_id}")
+
+                    except Exception as e:
+                        logger.error(f"[MonitoringWS] Error getting server status: {str(e)}")
+                        await websocket.send_json({
+                            "type": "error",
+                            "error": f"Failed to get server status: {str(e)}"
+                        })
+
+                else:
+                    logger.warning(f"[MonitoringWS] Unknown message type: {message_type}")
+
+            except asyncio.TimeoutError:
+                # No message received in 60 seconds, send heartbeat
+                await websocket.send_json({
+                    "type": "ping",
+                    "timestamp": time.time()
+                })
+
+            except json.JSONDecodeError as e:
+                logger.error(f"[MonitoringWS] Invalid JSON: {str(e)}")
+                await websocket.send_json({
+                    "type": "error",
+                    "error": "Invalid JSON format"
+                })
+
+    except WebSocketDisconnect:
+        logger.info(f"[MonitoringWS] Client {client_id} disconnected normally")
+
+    except Exception as e:
+        logger.error(f"[MonitoringWS] Error for client {client_id}: {str(e)}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "error": str(e)
+            })
+        except:
+            pass
+
+    finally:
+        # Clean up connection
+        if client_id in active_monitoring_connections:
+            del active_monitoring_connections[client_id]
+        logger.info(f"[MonitoringWS] Client {client_id} cleaned up. Active connections: {len(active_monitoring_connections)}")

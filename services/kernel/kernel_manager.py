@@ -99,17 +99,26 @@ def execute_code_with_kernel(
         if additional_plotly:
             result['plotly_figures'].extend(additional_plotly)
         
+        # Add execution history and variable history to result
+        if hasattr(kernel, 'execution_history'):
+            result['execution_history'] = kernel.execution_history
+        if hasattr(kernel, 'variables_history'):
+            result['variable_history'] = kernel.variables_history
+        
         return result
         
     except Exception as e:
         logger.error(f"Error executing code with kernel: {e}")
+        kernel = get_kernel()  # Get kernel for error handling
         return {
             'status': 'error',
             'error': str(e),
             'stdout': '',
             'stderr': str(e),
             'plots': [],
-            'execution_count': getattr(kernel, 'execution_count', 0)
+            'execution_count': getattr(kernel, 'execution_count', 0),
+            'execution_history': getattr(kernel, 'execution_history', []),
+            'variable_history': getattr(kernel, 'variables_history', {})
         }
 
 
@@ -239,7 +248,8 @@ def get_kernel_variables() -> Dict[str, Any]:
             if (not name.startswith('_') and 
                 not callable(value) and 
                 not hasattr(value, '__module__') and
-                name not in ['pd', 'np', 'plt', 'json', 'sys', 'io', 'warnings', 'os', 'datetime', 're', 'math', 'random']):
+                name not in ['pd', 'np', 'plt', 'json', 'sys', 'io', 'warnings', 'os', 'datetime', 're', 'math', 'random',
+                           'get_ipython', 'display', 'display_image', 'display_video', 'ls', 'pwd', 'history', 'who', 'whos', 'reset']):
                 try:
                     # Only include serializable variables
                     import pandas as pd
@@ -274,7 +284,8 @@ def clear_kernel_variables():
             if (not name.startswith('_') and 
                 not callable(kernel.namespace[name]) and 
                 not hasattr(kernel.namespace[name], '__module__') and
-                name not in ['pd', 'np', 'plt', 'json', 'sys', 'io', 'warnings', 'os', 'datetime', 're', 'math', 'random']):
+                name not in ['pd', 'np', 'plt', 'json', 'sys', 'io', 'warnings', 'os', 'datetime', 're', 'math', 'random',
+                           'get_ipython', 'display', 'display_image', 'display_video', 'ls', 'pwd', 'history', 'who', 'whos', 'reset']):
                 user_vars.append(name)
         
         # Remove user-defined variables
@@ -302,6 +313,8 @@ def get_kernel_status() -> Dict[str, Any]:
             'status': 'active',
             'execution_count': getattr(kernel, 'execution_count', 0),
             'variables_count': len(variables),
+            'variables': variables,  # Include current variables
+            'execution_history': getattr(kernel, 'execution_history', []),
             'has_temp_dir': hasattr(kernel, 'temp_dir'),
             'temp_dir': getattr(kernel, 'temp_dir', None)
         }

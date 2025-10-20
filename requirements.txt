@@ -30,3 +30,7 @@ streamlit-webrtc
 pillow
 imageio
 scikit-image
+
+# ZeroMQ for distributed kernel workers
+pyzmq
+redis

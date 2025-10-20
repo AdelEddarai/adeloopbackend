@@ -29,6 +29,7 @@ router = APIRouter(prefix="/api", tags=["execution"])
 async def execute_pipeline_code(request: Request):
     """
     Pipeline code execution endpoint for DataPipeline component
+    Supports variable sharing between blocks
     """
     try:
         data = await request.json()
@@ -37,10 +38,11 @@ async def execute_pipeline_code(request: Request):
         input_data = data.get('input_data', [])
         input_headers = data.get('input_headers', [])
         all_source_data = data.get('all_source_data', [])
-        
-        logger.info(f"Executing pipeline code: {language} with {len(input_data)} rows")
-        
-        # Execute code using kernel manager
+        variables = data.get('variables', {})  # Get shared variables from previous blocks
+
+        logger.info(f"Executing pipeline code: {language} with {len(input_data)} rows and {len(variables)} variables")
+
+        # Execute code using kernel manager with variable context
         result = execute_code_with_kernel(
             code=code,
             datasets=[{
@@ -48,7 +50,8 @@ async def execute_pipeline_code(request: Request):
                 'headers': input_headers,
                 'name': 'input_data'
             }] if input_data else [],
-            all_source_data=all_source_data
+            all_source_data=all_source_data,
+            variable_context=variables  # Pass variables to kernel
         )
 
         # Format response using response utilities

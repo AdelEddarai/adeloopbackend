@@ -37,9 +37,21 @@ class CustomJSONEncoder(json.JSONEncoder):
                 return "Infinity" if obj > 0 else "-Infinity"
             return float(obj)
         elif isinstance(obj, np.ndarray):
-            # Clean numpy array of NaN/infinity values
-            cleaned_array = np.where(np.isfinite(obj), obj, 0)
-            return cleaned_array.tolist()
+            # Check if array contains objects that need special handling
+            if obj.dtype == object:
+                # Convert to list first to handle special objects like range
+                obj_list = obj.tolist()
+                # Process the list to handle any remaining special objects
+                return self._clean_object_list(obj_list)
+            else:
+                # Clean numeric numpy arrays of NaN/infinity values
+                try:
+                    cleaned_array = np.where(np.isfinite(obj), obj, 0)
+                    return cleaned_array.tolist()
+                except (TypeError, ValueError):
+                    # If isfinite fails, convert to list and handle element by element
+                    obj_list = obj.tolist()
+                    return self._clean_object_list(obj_list)
         elif isinstance(obj, pd.DataFrame):
             # Clean DataFrame before converting to dict
             cleaned_df = self._clean_dataframe_for_serialization(obj)
@@ -48,7 +60,31 @@ class CustomJSONEncoder(json.JSONEncoder):
             # Clean Series before converting to list
             cleaned_series = obj.replace([np.inf, -np.inf], np.nan).fillna(0)
             return cleaned_series.tolist()
+        elif isinstance(obj, range):
+            # Convert range objects to lists
+            return list(obj)
         return super().default(obj)
+    
+    def _clean_object_list(self, obj_list):
+        """Clean a list that may contain special objects"""
+        cleaned_list = []
+        for item in obj_list:
+            if isinstance(item, range):
+                # Convert range objects to lists
+                cleaned_list.append(list(item))
+            elif isinstance(item, (list, tuple)):
+                # Recursively clean nested lists/tuples
+                cleaned_list.append(self._clean_object_list(list(item)))
+            elif isinstance(item, float) and math.isnan(item):
+                # Replace NaN with None
+                cleaned_list.append(None)
+            elif isinstance(item, float) and math.isinf(item):
+                # Replace infinity with None
+                cleaned_list.append(None)
+            else:
+                # Keep the item as is
+                cleaned_list.append(item)
+        return cleaned_list
     
     def _clean_dataframe_for_serialization(self, df):
         """Clean DataFrame to ensure JSON serialization compatibility"""
