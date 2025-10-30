@@ -124,108 +124,38 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("WebSocket connection closed")
 
 async def handle_code_execution(websocket: WebSocket, message: Dict[str, Any], kernel):
-    """Handle code execution requests"""
+    """Handle code execution requests with real-time streaming"""
     try:
         code = message.get("code", "")
         cell_id = message.get("cell_id", "unknown")
         language = message.get("language", "python")
         datasets = message.get("datasets", [])
         is_streaming_request = message.get("streaming", False)
-        
+
         logger.info(f"Executing {language} code in cell {cell_id}")
-        
+
         # Send execution start notification
-        start_message = {
+        await websocket.send_text(json.dumps({
             "type": "execution_start",
             "cell_id": cell_id
-        }
-        
-        # Add kernel_id for streaming requests
-        if is_streaming_request:
-            kernel_id = f"kernel_{int(asyncio.get_event_loop().time() * 1000000)}"
-            start_message["kernel_id"] = kernel_id
-        
-        await websocket.send_text(json.dumps(start_message, cls=CustomJSONEncoder))
-        
-        # Execute code using kernel manager
-        result = execute_code_with_kernel(
-            code=code,
-            datasets=datasets
-        )
+        }, cls=CustomJSONEncoder))
 
-        # Format response using response utilities (same as REST API)
-        from utils.responses import format_execution_response
-        formatted_result = format_execution_response(result)
-        
-        # For streaming requests, we send output line by line
-        if is_streaming_request:
-            # Split output into lines and send each line separately
-            output_lines = result.get("stdout", "").split('\n')
-            for i, line in enumerate(output_lines):
-                if line.strip():  # Only send non-empty lines
-                    # Send streaming output
-                    stream_message = {
-                        "type": "stream_output",
-                        "cell_id": cell_id,
-                        "content": line + '\n',
-                        "is_last": False
-                    }
-                    await websocket.send_text(json.dumps(stream_message, cls=CustomJSONEncoder))
-                    # Small delay between lines to simulate real-time output
-                    await asyncio.sleep(0.1)
-            
-            # Send final streaming output message to indicate completion
-            final_stream_message = {
-                "type": "stream_output",
-                "cell_id": cell_id,
-                "content": formatted_result.get("output", ""),  # Use formatted result
-                "is_last": True,
-                "result": {
-                    "status": formatted_result.get("status", "ok"),
-                    "output": formatted_result.get("output", ""),
-                    "error": formatted_result.get("error", ""),
-                    "plots": formatted_result.get("plots", []),  # This now includes both matplotlib and plotly
-                    "data": formatted_result.get("data"),
-                    "result": formatted_result.get("result"),
-                    "table_result": result.get("table_result"),  # Keep original for table_result
-                    "dataframe_variables": result.get("dataframe_variables", []),  # Keep original
-                    "variables": result.get("variables", {}),  # Keep original
-                    "execution_count": formatted_result.get("execution_count", 0),
-                    "execution_history": result.get("execution_history", []),
-                    "variable_history": result.get("variable_history", {})
-                },
-                "error": result.get("error"),
-                "executionTime": 0  # Will be calculated by frontend
-            }
-            await websocket.send_text(json.dumps(final_stream_message, cls=CustomJSONEncoder))
+        # Use modern streaming executor for enterprise-grade real-time output
+        from services.kernel.streaming_executor import StreamingExecutor
+        executor = StreamingExecutor(kernel)
+
+        # Check if streaming is requested
+        use_realtime = message.get('streaming', False)
+
+        if use_realtime:
+            # Use real-time streaming for better performance than Jupyter/Databricks
+            async for chunk in executor.execute_realtime_streaming(code, cell_id):
+                await websocket.send_text(json.dumps(chunk, cls=CustomJSONEncoder))
         else:
-            # Send result back to client in standard format using formatted response
-            response = {
-                "type": "execution_result",
-                "cell_id": cell_id,
-                "status": formatted_result.get("status", "ok"),
-                "output": formatted_result.get("output", ""),
-                "error": formatted_result.get("error", ""),
-                "plots": formatted_result.get("plots", []),  # This now includes both matplotlib and plotly
-                "data": formatted_result.get("data"),
-                "result": formatted_result.get("result"),
-                "table_result": result.get("table_result"),  # Keep original for table_result
-                "dataframe_variables": result.get("dataframe_variables", []),  # Keep original
-                "variables": result.get("variables", {}),  # Keep original
-                "execution_count": formatted_result.get("execution_count", 0),
-                "execution_history": result.get("execution_history", []),  # Keep original
-                "variable_history": result.get("variable_history", {})  # Keep original
-            }
-            
-            # Include error details if present
-            if result.get("error"):
-                response["error_details"] = {
-                    "message": result["error"].get("evalue", "") if isinstance(result["error"], dict) else result["error"],
-                    "traceback": result["error"].get("traceback", []) if isinstance(result["error"], dict) else []
-                }
-            
-            await websocket.send_text(json.dumps(response, cls=CustomJSONEncoder))
-        
+            # Use standard streaming
+            async for chunk in executor.execute_streaming(code, cell_id):
+                await websocket.send_text(json.dumps(chunk, cls=CustomJSONEncoder))
+
     except InputRequiredException as e:
         # Handle input request
         logger.info(f"Input required: {e.prompt}")
@@ -234,7 +164,7 @@ async def handle_code_execution(websocket: WebSocket, message: Dict[str, Any], k
             "prompt": e.prompt,
             "original_code": code
         }, cls=CustomJSONEncoder))
-        
+
     except Exception as e:
         logger.error(f"Execution error: {str(e)}")
         logger.error(traceback.format_exc())
@@ -246,106 +176,6 @@ async def handle_code_execution(websocket: WebSocket, message: Dict[str, Any], k
                 "traceback": traceback.format_exc().split('\n')
             }
         }, cls=CustomJSONEncoder))
-
-
-# Add this new function for streaming execution
-async def execute_code_with_streaming(kernel, code: str, datasets: list, websocket: WebSocket, cell_id: str):
-    """
-    Execute code with real-time output streaming even without Redis/ZeroMQ
-    """
-    import io
-    import sys
-    import contextlib
-    import asyncio
-    
-    # Capture stdout and stderr
-    stdout_capture = io.StringIO()
-    stderr_capture = io.StringIO()
-    
-    result = None
-    error_info = None
-    
-    try:
-        # Redirect stdout and stderr
-        with contextlib.redirect_stdout(stdout_capture), \
-             contextlib.redirect_stderr(stderr_capture):
-            
-            # Execute code line by line to capture output in real-time
-            lines = code.split('\n')
-            for line in lines:
-                if line.strip():  # Skip empty lines
-                    try:
-                        # Execute single line
-                        exec(line, kernel.namespace)
-                        
-                        # Check for output and send it immediately
-                        stdout_text = stdout_capture.getvalue()
-                        if stdout_text:
-                            # Send streaming output
-                            stream_message = {
-                                "type": "stream_output",
-                                "cell_id": cell_id,
-                                "content": stdout_text,
-                                "is_last": False
-                            }
-                            await websocket.send_text(json.dumps(stream_message, cls=CustomJSONEncoder))
-                            # Clear the captured output
-                            stdout_capture.seek(0)
-                            stdout_capture.truncate(0)
-                            
-                        # Small delay to allow real-time output
-                        await asyncio.sleep(0.01)
-                        
-                    except Exception as line_error:
-                        # Handle line execution error
-                        error_info = {
-                            'ename': type(line_error).__name__,
-                            'evalue': str(line_error),
-                            'traceback': traceback.format_exc().split('\n')
-                        }
-                        break
-        
-        # Get any remaining output
-        stdout_text = stdout_capture.getvalue()
-        stderr_text = stderr_capture.getvalue()
-        
-        # Try to get the result of the last expression if it exists
-        try:
-            code_lines = [line.strip() for line in code.strip().split('\n') if line.strip()]
-            if code_lines:
-                last_line = code_lines[-1]
-                # Check if the last line is an expression (not a statement)
-                compile(last_line, '<string>', 'eval')
-                # If successful, evaluate it to get the result
-                result = eval(last_line, kernel.namespace)
-        except (SyntaxError, TypeError):
-            # Last line is a statement, not an expression
-            result = None
-            
-    except Exception as e:
-        error_info = {
-            'ename': type(e).__name__,
-            'evalue': str(e),
-            'traceback': traceback.format_exc().split('\n')
-        }
-    
-    # Return result in the same format as execute_code_with_kernel
-    return {
-        'execution_count': kernel.execution_count,
-        'status': 'error' if error_info else 'ok',
-        'stdout': stdout_capture.getvalue(),
-        'stderr': stderr_capture.getvalue(),
-        'result': result,
-        'plots': [],
-        'html_outputs': [],
-        'error': error_info,
-        'variables': {},
-        'data': None,
-        'media_count': 0,
-        'plot_count': 0,
-        'display_count': 0,
-        'plotly_count': 0
-    }
 
 
 async def handle_input_provision(websocket: WebSocket, message: Dict[str, Any], kernel):

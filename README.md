@@ -1,6 +1,6 @@
-# HRatlas Backend - Refactored Architecture
+# Adeloop Backend - Refactored Architecture
 
-This document describes the refactored backend architecture for HRatlas, which has been reorganized for better maintainability, scalability, and code organization.
+This document describes the refactored backend architecture for Adeloop, which has been reorganized for better maintainability, scalability, and code organization.
 
 ## 🏗️ Architecture Overview
 

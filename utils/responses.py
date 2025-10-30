@@ -63,6 +63,29 @@ class CustomJSONEncoder(json.JSONEncoder):
         elif isinstance(obj, range):
             # Convert range objects to lists
             return list(obj)
+        elif hasattr(obj, '__module__') and obj.__module__:
+            # Handle modules and module objects
+            return {
+                "type": "module",
+                "name": getattr(obj, '__name__', str(obj)),
+                "module": obj.__module__
+            }
+        elif callable(obj):
+            # Handle functions and callable objects
+            return {
+                "type": "function",
+                "name": getattr(obj, '__name__', str(obj)),
+                "repr": str(obj)
+            }
+        elif hasattr(obj, '__dict__'):
+            # Handle custom objects with attributes
+            try:
+                return {
+                    "type": type(obj).__name__,
+                    "repr": str(obj)[:200] + "..." if len(str(obj)) > 200 else str(obj)
+                }
+            except:
+                return {"type": type(obj).__name__, "repr": "<object>"}
         return super().default(obj)
     
     def _clean_object_list(self, obj_list):

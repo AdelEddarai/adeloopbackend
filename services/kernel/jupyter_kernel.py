@@ -432,8 +432,9 @@ class JupyterKernel:
             def custom_plotly_show(fig_self, *args, **kwargs):
                 try:
                     # Generate HTML output that can be displayed directly - Jupyter-style responsive
+                    # Use CDN instead of inline for better performance and compatibility
                     fig_html = fig_self.to_html(
-                        include_plotlyjs='inline',
+                        include_plotlyjs='cdn',
                         div_id=f"plotly-div-{len(kernel_instance._plotly_figures)}",
                         config={
                             'displayModeBar': True,
@@ -516,6 +517,38 @@ class JupyterKernel:
                 sys.stdout = old_stdout
             if old_stderr is not None:
                 sys.stderr = old_stderr
+
+        # Setup Altair to capture charts
+        self._altair_charts = []
+        try:
+            import altair as alt
+
+            # Store original renderer
+            self._original_altair_renderer = alt.renderers.active
+
+            # Create custom renderer that captures chart specs
+            kernel_instance = self
+
+            def altair_capture_renderer(spec, **kwargs):
+                """Custom Altair renderer that captures Vega-Lite specs"""
+                try:
+                    # Store the Vega-Lite spec
+                    kernel_instance._altair_charts.append(spec)
+                    print(f"📊 Altair chart captured as Vega-Lite spec")
+                except Exception as e:
+                    print(f"❌ Failed to capture Altair chart: {str(e)}")
+                return {}  # Return empty dict to satisfy renderer interface
+
+            # Register and enable our custom renderer
+            alt.renderers.register('capture', altair_capture_renderer)
+            alt.renderers.enable('capture')
+
+            # Add altair to namespace
+            self.namespace['alt'] = alt
+
+        except ImportError:
+            # Altair not installed, add placeholder
+            self.namespace['alt'] = None
 
     def capture_plots(self) -> List[str]:
         """Capture all matplotlib plots as base64 images with enhanced reliability"""
@@ -623,6 +656,32 @@ class JupyterKernel:
             self._plotly_figures = []
 
         return plotly_plots
+
+    def capture_altair_charts(self) -> List[dict]:
+        """Capture all Altair/Vega-Lite charts as JSON specs"""
+        altair_charts = []
+
+        if hasattr(self, '_altair_charts'):
+            for chart_spec in self._altair_charts:
+                try:
+                    # Altair charts are already JSON specs
+                    if isinstance(chart_spec, dict):
+                        altair_charts.append(chart_spec)
+                        print(f"✅ Altair chart captured as Vega-Lite spec")
+                    elif isinstance(chart_spec, str):
+                        # Try to parse if it's a JSON string
+                        import json
+                        spec = json.loads(chart_spec)
+                        altair_charts.append(spec)
+                        print(f"✅ Altair chart parsed from JSON string")
+                except Exception as e:
+                    print(f"❌ Error processing Altair chart: {str(e)}")
+                    pass
+
+            # Clear the charts for next execution
+            self._altair_charts = []
+
+        return altair_charts
 
     def provide_input_and_continue(self, user_input: str, original_code: str):
         """Provide user input and continue execution like Jupyter - FIXED for multiple inputs"""
@@ -1474,9 +1533,16 @@ class JupyterKernel:
 
         # Track variable changes for history
         user_variables = {}
+        overwritten_variables = []  # Track variables that were overwritten
+
+        # Get previous variables to detect overwrites
+        previous_variables = {}
+        if self.execution_count > 0 and self.execution_count - 1 in self.variables_history:
+            previous_variables = self.variables_history[self.execution_count - 1]
+
         for name, value in self.namespace.items():
-            if (not name.startswith('_') and 
-                not callable(value) and 
+            if (not name.startswith('_') and
+                not callable(value) and
                 not hasattr(value, '__module__') and
                 name not in ['pd', 'np', 'plt', 'json', 'sys', 'io', 'warnings', 'os', 'datetime', 're', 'math', 'random', 'base64',
                            'get_ipython', 'display', 'display_image', 'display_video', 'ls', 'pwd', 'history', 'who', 'whos', 'reset']):
@@ -1490,9 +1556,17 @@ class JupyterKernel:
                         user_variables[name] = f"Array{value.shape}"
                     else:
                         user_variables[name] = str(type(value).__name__)
+
+                    # Check if this variable existed before (overwrite detection)
+                    if name in previous_variables:
+                        overwritten_variables.append({
+                            'name': name,
+                            'previous_value': previous_variables[name],
+                            'new_value': user_variables[name]
+                        })
                 except:
                     user_variables[name] = "Object"
-        
+
         # Store variables in history
         self.variables_history[self.execution_count] = user_variables
 
@@ -1515,6 +1589,7 @@ class JupyterKernel:
             'variables': user_variables,  # Include current variables
             'execution_history': self.execution_history,  # Include execution history
             'variable_history': self.variables_history,  # Include variable history
+            'overwritten_variables': overwritten_variables,  # Include overwritten variables
             'data': None,
             'media_count': len(display_outputs),
             'plot_count': len(matplotlib_plots),
