@@ -249,11 +249,19 @@ class StreamingExecutor:
         Yields:
             Dictionary with streaming output data
         """
+        import os
         
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
         
+        # Store original working directory
+        original_cwd = os.getcwd()
+        
         try:
+            # Change to kernel temp directory if available (for CSV access)
+            if hasattr(self.kernel, 'temp_dir') and os.path.exists(self.kernel.temp_dir):
+                os.chdir(self.kernel.temp_dir)
+            
             # Compile code first to catch syntax errors
             compiled = compile(code, '<string>', 'exec')
             
@@ -382,6 +390,12 @@ class StreamingExecutor:
                     "traceback": error_traceback.split('\n')
                 }
             }
+        finally:
+            # Always restore original working directory
+            try:
+                os.chdir(original_cwd)
+            except:
+                pass
     
     async def execute_with_line_streaming(
         self,
@@ -404,12 +418,19 @@ class StreamingExecutor:
         Yields:
             Dictionary with streaming output data
         """
+        import os
         
         lines = code.split('\n')
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
         
+        # Store original working directory
+        original_cwd = os.getcwd()
+        
         try:
+            # Change to kernel temp directory if available (for CSV access)
+            if hasattr(self.kernel, 'temp_dir') and os.path.exists(self.kernel.temp_dir):
+                os.chdir(self.kernel.temp_dir)
             for line_num, line in enumerate(lines):
                 if not line.strip():  # Skip empty lines
                     continue
@@ -502,4 +523,10 @@ class StreamingExecutor:
                     "traceback": error_traceback.split('\n')
                 }
             }
+        finally:
+            # Always restore original working directory
+            try:
+                os.chdir(original_cwd)
+            except:
+                pass
 

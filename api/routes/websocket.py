@@ -140,6 +140,12 @@ async def handle_code_execution(websocket: WebSocket, message: Dict[str, Any], k
             "cell_id": cell_id
         }, cls=CustomJSONEncoder))
 
+        # Prepare datasets before execution
+        if datasets:
+            from services.kernel.kernel_manager import _prepare_datasets_for_kernel
+            _prepare_datasets_for_kernel(kernel, datasets)
+            logger.info(f"Prepared {len(datasets)} datasets for execution")
+
         # Use modern streaming executor for enterprise-grade real-time output
         from services.kernel.streaming_executor import StreamingExecutor
         executor = StreamingExecutor(kernel)

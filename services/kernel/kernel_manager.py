@@ -61,6 +61,11 @@ def execute_code_with_kernel(
     kernel = get_kernel()
     
     try:
+        import os
+        
+        # Store original working directory
+        original_cwd = os.getcwd()
+        
         # Handle user input if provided
         if user_input is not None:
             logger.debug(f"Received user input: {user_input}")
@@ -81,8 +86,16 @@ def execute_code_with_kernel(
         if variable_context:
             _inject_variable_context(kernel, variable_context)
         
+        # Ensure we're in the kernel temp directory for CSV access
+        if hasattr(kernel, 'temp_dir') and os.path.exists(kernel.temp_dir):
+            os.chdir(kernel.temp_dir)
+            logger.debug(f"Changed working directory to: {kernel.temp_dir}")
+        
         # Execute the code
         result = kernel.execute_code(code, datasets)
+        
+        # Restore original working directory
+        os.chdir(original_cwd)
         
         # Ensure both matplotlib and Plotly plots are captured
         if 'plots' not in result:
@@ -109,6 +122,14 @@ def execute_code_with_kernel(
         
     except Exception as e:
         logger.error(f"Error executing code with kernel: {e}")
+        # Restore original working directory on error
+        try:
+            import os
+            if 'original_cwd' in locals():
+                os.chdir(original_cwd)
+        except:
+            pass
+            
         kernel = get_kernel()  # Get kernel for error handling
         return {
             'status': 'error',
@@ -134,6 +155,14 @@ def _prepare_datasets_for_kernel(kernel, datasets: list):
         import pandas as pd
         import os
         
+        # Change working directory to kernel temp directory so pd.read_csv() works
+        original_cwd = os.getcwd()
+        os.chdir(kernel.temp_dir)
+        
+        # Store original directory in kernel namespace for reference
+        kernel.namespace['_original_cwd'] = original_cwd
+        kernel.namespace['_kernel_temp_dir'] = kernel.temp_dir
+        
         for i, dataset in enumerate(datasets):
             if dataset and 'data' in dataset:
                 df_data = pd.DataFrame(dataset['data'])
@@ -153,6 +182,7 @@ def _prepare_datasets_for_kernel(kernel, datasets: list):
                     kernel.namespace['df'] = df_data
 
                 # Create virtual CSV files so pd.read_csv() works
+                # Use the original dataset name (with .csv extension)
                 csv_filename = f"{dataset_name}.csv" if dataset_name else f"dataset{i+1}.csv"
                 csv_path = os.path.join(kernel.temp_dir, csv_filename)
                 df_data.to_csv(csv_path, index=False)
@@ -161,7 +191,33 @@ def _prepare_datasets_for_kernel(kernel, datasets: list):
                 numbered_csv = os.path.join(kernel.temp_dir, f"dataset{i+1}.csv")
                 df_data.to_csv(numbered_csv, index=False)
                 
+                # Create a version with safe name
+                safe_csv = os.path.join(kernel.temp_dir, f"{safe_name}.csv")
+                df_data.to_csv(safe_csv, index=False)
+                
                 logger.debug(f"Prepared dataset: {safe_name} with shape {df_data.shape}")
+                logger.debug(f"Created CSV files: {csv_filename}, {safe_name}.csv, dataset{i+1}.csv")
+        
+        # Create a helper variable to show available datasets
+        if datasets:
+            dataset_info = []
+            for i, dataset in enumerate(datasets):
+                if dataset and 'data' in dataset:
+                    dataset_name = dataset.get('name', f'Dataset {i+1}')
+                    safe_name = dataset_name.lower().replace(' ', '_').replace('-', '_')
+                    safe_name = ''.join(c for c in safe_name if c.isalnum() or c == '_')
+                    if not safe_name or safe_name[0].isdigit():
+                        safe_name = f'dataset_{safe_name}' if safe_name else f'dataset_{i+1}'
+                    
+                    dataset_info.append({
+                        'name': dataset_name,
+                        'variable': safe_name,
+                        'csv_file': f"{dataset_name}.csv",
+                        'shape': (len(dataset['data']), len(dataset['data'][0]) if dataset['data'] else 0)
+                    })
+            
+            kernel.namespace['_available_datasets'] = dataset_info
+            logger.info(f"Prepared {len(datasets)} datasets. Available as: {[d['variable'] for d in dataset_info]}")
                 
     except Exception as e:
         logger.error(f"Error preparing datasets: {e}")
