@@ -34,3 +34,4 @@ scikit-image
 # ZeroMQ for distributed kernel workers
 pyzmq
 redis
+duckdb

@@ -10,6 +10,7 @@ It provides functionality for:
 """
 
 import logging
+import pandas as pd
 from typing import Dict, Any, Optional
 from services.kernel.jupyter_kernel import get_kernel as _get_kernel, reset_kernel as _reset_kernel
 
@@ -146,6 +147,7 @@ def execute_code_with_kernel(
 def _prepare_datasets_for_kernel(kernel, datasets: list):
     """
     Prepare and inject datasets into the kernel namespace
+    Handles both local datasets and external database tables
     
     Args:
         kernel: The kernel instance
@@ -164,7 +166,34 @@ def _prepare_datasets_for_kernel(kernel, datasets: list):
         kernel.namespace['_kernel_temp_dir'] = kernel.temp_dir
         
         for i, dataset in enumerate(datasets):
-            if dataset and 'data' in dataset:
+            if not dataset:
+                continue
+                
+            # Check if this is an external table (has externalMetadata but no data)
+            is_external = dataset.get('isExternal', False)
+            has_data = 'data' in dataset and dataset['data']
+            external_metadata = dataset.get('externalMetadata', {})
+            
+            # If it's an external table without data, fetch it automatically
+            if is_external and not has_data and external_metadata:
+                logger.info(f"🔄 Auto-fetching external table: {dataset.get('name')}")
+                try:
+                    df_data = _fetch_external_table_data(external_metadata)
+                    if df_data is not None and not df_data.empty:
+                        dataset['data'] = df_data.to_dict('records')
+                        has_data = True
+                        logger.info(f"✅ Fetched {len(df_data)} rows from external table: {dataset.get('name')}")
+                    else:
+                        logger.warning(f"⚠️ External table {dataset.get('name')} returned no data")
+                        continue
+                except Exception as fetch_error:
+                    logger.error(f"❌ Failed to fetch external table {dataset.get('name')}: {fetch_error}")
+                    # Create an empty DataFrame as fallback
+                    df_data = pd.DataFrame()
+                    logger.warning(f"Using empty DataFrame for {dataset.get('name')}")
+            
+            # Now process the dataset (either local or fetched external)
+            if has_data:
                 df_data = pd.DataFrame(dataset['data'])
                 dataset_name = dataset.get('name', f'Dataset {i+1}')
 
@@ -195,7 +224,8 @@ def _prepare_datasets_for_kernel(kernel, datasets: list):
                 safe_csv = os.path.join(kernel.temp_dir, f"{safe_name}.csv")
                 df_data.to_csv(safe_csv, index=False)
                 
-                logger.debug(f"Prepared dataset: {safe_name} with shape {df_data.shape}")
+                source_type = "external" if is_external else "local"
+                logger.debug(f"Prepared {source_type} dataset: {safe_name} with shape {df_data.shape}")
                 logger.debug(f"Created CSV files: {csv_filename}, {safe_name}.csv, dataset{i+1}.csv")
         
         # Create a helper variable to show available datasets
@@ -209,11 +239,13 @@ def _prepare_datasets_for_kernel(kernel, datasets: list):
                     if not safe_name or safe_name[0].isdigit():
                         safe_name = f'dataset_{safe_name}' if safe_name else f'dataset_{i+1}'
                     
+                    is_external = dataset.get('isExternal', False)
                     dataset_info.append({
                         'name': dataset_name,
                         'variable': safe_name,
                         'csv_file': f"{dataset_name}.csv",
-                        'shape': (len(dataset['data']), len(dataset['data'][0]) if dataset['data'] else 0)
+                        'shape': (len(dataset['data']), len(dataset['data'][0]) if dataset['data'] else 0),
+                        'type': 'external' if is_external else 'local'
                     })
             
             kernel.namespace['_available_datasets'] = dataset_info
@@ -221,6 +253,112 @@ def _prepare_datasets_for_kernel(kernel, datasets: list):
                 
     except Exception as e:
         logger.error(f"Error preparing datasets: {e}")
+
+
+def _fetch_external_table_data(external_metadata: Dict[str, Any]) -> Optional[pd.DataFrame]:
+    """
+    Fetch data from an external database table
+    
+    Args:
+        external_metadata: Dictionary containing connection details and table name
+        
+    Returns:
+        pandas DataFrame with the table data, or None if fetch fails
+    """
+    try:
+        import pandas as pd
+        
+        db_type = external_metadata.get('type', '').lower()
+        host = external_metadata.get('host')
+        port = external_metadata.get('port')
+        database = external_metadata.get('database')
+        table = external_metadata.get('table')
+        username = external_metadata.get('username')
+        password = external_metadata.get('password')
+        
+        if not all([host, database, table]):
+            logger.error(f"Missing required connection details: host={host}, database={database}, table={table}")
+            return None
+        
+        logger.info(f"Connecting to {db_type} database: {host}:{port}/{database}")
+        
+        # PostgreSQL
+        if db_type == 'postgresql':
+            try:
+                import psycopg2
+                conn_string = f"host='{host}' port='{port}' dbname='{database}'"
+                if username:
+                    conn_string += f" user='{username}'"
+                if password:
+                    conn_string += f" password='{password}'"
+                    
+                conn = psycopg2.connect(conn_string)
+                query = f'SELECT * FROM "{table}" LIMIT 10000'
+                df = pd.read_sql(query, conn)
+                conn.close()
+                return df
+            except ImportError:
+                logger.error("psycopg2 not installed. Install with: pip install psycopg2-binary")
+                return None
+        
+        # MySQL
+        elif db_type == 'mysql':
+            try:
+                import pymysql
+                conn = pymysql.connect(
+                    host=host,
+                    port=int(port) if port else 3306,
+                    user=username or 'root',
+                    password=password or '',
+                    database=database
+                )
+                query = f'SELECT * FROM `{table}` LIMIT 10000'
+                df = pd.read_sql(query, conn)
+                conn.close()
+                return df
+            except ImportError:
+                logger.error("pymysql not installed. Install with: pip install pymysql")
+                return None
+        
+        # MongoDB
+        elif db_type == 'mongodb':
+            try:
+                from pymongo import MongoClient
+                conn_string = f"mongodb://"
+                if username and password:
+                    conn_string += f"{username}:{password}@"
+                conn_string += f"{host}:{port}/{database}"
+                
+                client = MongoClient(conn_string)
+                db = client[database]
+                collection = db[table]
+                data = list(collection.find().limit(10000))
+                
+                # Convert MongoDB documents to DataFrame
+                if data:
+                    # Remove _id field if present
+                    for doc in data:
+                        if '_id' in doc:
+                            doc['_id'] = str(doc['_id'])
+                    df = pd.DataFrame(data)
+                else:
+                    df = pd.DataFrame()
+                    
+                client.close()
+                return df
+            except ImportError:
+                logger.error("pymongo not installed. Install with: pip install pymongo")
+                return None
+        
+        else:
+            logger.error(f"Unsupported database type: {db_type}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error fetching external table data: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
 
 
 def _prepare_all_source_data_for_kernel(kernel, all_source_data: list):
